@@ -235,9 +235,57 @@ t=0:00  DOWN ganha:
 
 ---
 
-## 15. Peg Arbit
+## 15. Peg Arbit — Arbitragem Risk-Free via Order Book
 
-Quando `ask_up + ask_down <= 0.98`, compra ambos os lados. Um resolve a $1.00/share. Lucro garantido após fees porque o trigger cobre a margem de fees (~1.5%/lado).
+A arbitragem Peg Arbit é a operação mais segura do bot. Compra SHARES IGUAIS dos dois lados (UP e DOWN) quando a soma dos ASKs está abaixo de $1.00. Como um dos lados resolve sempre a $1.00/share, o lucro é garantido.
+
+**Lógica de cálculo (Order Book Execution):**
+
+```
+1. Identifica Lowest Ask UP  (preço mais baixo que vendedores aceitam para UP)
+2. Identifica Lowest Ask DOWN (preço mais baixo que vendedores aceitam para DOWN)
+3. Calcula o Peg: Peg = Lowest_Ask_UP + Lowest_Ask_DOWN
+```
+
+**Condição de entrada (Trigger):**
+```
+Peg < 0.98  (PA_TRIGGER_SUM)
+```
+
+A margem de 0.02 (1.00 - 0.98) absorve fees nos dois lados, slippage, e variações de liquidez no topo do order book.
+
+**Shares iguais nos dois lados:**
+```python
+cost_per_share = ask_up + ask_down + fee(ask_up) + fee(ask_down)
+shares = budget / cost_per_share    # IGUAL para ambos os lados
+```
+
+**Profitability gate:** antes de entrar, verifica que o lucro líquido (após fees) é positivo. Se as fees comem a margem, rejeita com `REJECT_FEES`.
+
+**Exemplo real:**
+```
+Ask UP = 46c, Ask DOWN = 50c
+Peg = 0.96 (< 0.98 → TRIGGER!)
+
+Compra 2.56 shares de UP  @ 46c = $1.18 + fee $0.018
+Compra 2.56 shares de DOWN @ 50c = $1.28 + fee $0.020
+
+Custo total = $2.50
+Se UP ganha: payout = 2.56 × $1.00 = $2.56
+Lucro = $2.56 - $2.50 = $0.064 (+2.57%)
+
+Se DOWN ganha: payout = 2.56 × $1.00 = $2.56
+Lucro = $2.56 - $2.50 = $0.064 (+2.57%)
+
+→ LUCRO GARANTIDO independentemente do resultado!
+```
+
+**Quando NÃO entra:**
+```
+Ask UP = 46c, Ask DOWN = 55c
+Peg = 1.01 (> 0.98 → BLOCKED)
+Custo > payout → perda garantida → NÃO comprar
+```
 
 ---
 
