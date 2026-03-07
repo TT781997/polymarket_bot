@@ -85,12 +85,12 @@ from typing import Optional, List, Tuple
 
 LIVE_TRADING    = False      # Ativa a execução real de ordens. Falso = Paper Trading. Unidade: Booleano. Range: True / False.
 BANKROLL_DEMO   = 10.0       # Saldo inicial para simulação (Paper Trading). Unidade: USD/USDC. Range: 0.0 - Infinito.
-SLIPPAGE_TOLERANCE = 0.04    # Derrapagem máxima permitida no preço de execução. Unidade: USD (0.04 = 4 cêntimos). Range: 0.00 - 1.00.
+SLIPPAGE_TOLERANCE = 0.02    # Derrapagem máxima permitida no preço de execução. Unidade: USD (0.02 = 2 cêntimos). Range: 0.00 - 1.00.
 
 # --- AGGRESSIVE ENDGAME ---
 AGGRESSIVE_ENDGAME_ACTIVE = True  # Ativa o modo de trading agressivo nos últimos segundos do mercado. Unidade: Booleano. Range: True / False.
 AGGRESSIVE_ENDGAME_RISK   = 0.03  # Percentagem da banca a arriscar neste modo. Unidade: Decimal (0.03 = 3%). Range: 0.0 - 1.0.
-AGGRESSIVE_ENDGAME_S      = 2.0   # Tempo restante para ativar o Endgame. Unidade: Segundos. Range: 0.0 - 60.0.
+AGGRESSIVE_ENDGAME_S      = 15.0   # Tempo restante para ativar o Endgame. Unidade: Segundos. Range: 0.0 - 60.0.
 AGGRESSIVE_ENDGAME_MIN_C  = 0.75  # Preço mínimo para entrar em posições no Endgame. Unidade: USD (75 cêntimos). Range: 0.0 - 1.0.
 AGGRESSIVE_ENDGAME_MAX_C  = 0.95  # Preço máximo para entrar em posições no Endgame. Unidade: USD (95 cêntimos). Range: 0.0 - 1.0.
 
@@ -103,7 +103,7 @@ MART_MAX_MULT = 8            # Multiplicador máximo de redobramento da aposta (
 
 # --- BASE RISK ---
 PEG_ARBIT_RISK   = 0.25      # Fração da banca alocada especificamente a arbitragem. Unidade: Decimal (25%). Range: 0.0 - 1.0.
-MAX_RISK_PERCENT = 1         # Risco global máximo por trade (geralmente % inteira). Unidade: Inteiro (1 = 1%). Range: 1 - 100.
+MAX_RISK_PERCENT = 5         # Risco global máximo por trade (geralmente % inteira). Unidade: Inteiro (1 = 1%). Range: 1 - 100.
 
 # --- TOGGLES ---
 PEG_ARBIT_ACTIVE   = True    # Ativa arbitragem Risk-Free (comprar ambos os lados). Unidade: Booleano.
@@ -112,14 +112,14 @@ STOP_LOSS_ACTIVE   = False   # Ativa fecho automático de posições em prejuíz
 TAKE_PROFIT_ACTIVE = False   # Ativa fecho automático de posições em lucro. Unidade: Booleano.
 
 # --- PEG ARBIT ---
-PA_TRIGGER_SUM  = 0.980      # Soma máx dos Asks (Up+Down) para acionar arbitragem (2 cêntimos de margem). Unidade: USD. Range: 0.0 - 1.0.
+PA_TRIGGER_SUM  = 0.990      # Soma máx dos Asks (Up+Down) para acionar arbitragem (1 cêntimo de margem). Unidade: USD. Range: 0.0 - 1.0.
 PA_COOLDOWN     = 0.05       # Tempo de espera entre ordens de arbitragem. Unidade: Segundos. Range: 0.0 - 60.0.
 PA_MIN_REM      = 1.0        # Tempo mínimo restante de mercado para permitir arbitragem. Unidade: Segundos. Range: 0.0 - Infinito.
 PA_TARGET_BID_C = 0.0        # Preço Bid alvo para Limit Orders (0.0 = Market Taker). Unidade: USD. Range: 0.0 - 1.0.
 MAX_PA_ENTRIES  = 10_000_000 # Limite máximo de trades de arbitragem na sessão. Unidade: Contagem (Inteiro). Range: 1 - Infinito.
 
 # --- GAMBLING ---
-GAMB_START_REM_S  = 60       # Só inicia trading direcional quando faltar este tempo. Unidade: Segundos. Range: 0 - Infinito.
+GAMB_START_REM_S  = 300       # Só inicia trading direcional quando faltar este tempo. Unidade: Segundos. Range: 0 - Infinito.
 GAMB_CUTOFF_S     = 0        # Para o trading direcional abaixo deste tempo. Unidade: Segundos. Range: 0 - GAMB_START_REM_S.
 GAMB_MIN_ASK_C    = 75.0     # Preço mínimo ASK bruto para entrar (Notar: está em CÊNTIMOS reais). Unidade: Cêntimos. Range: 0.0 - 100.0.
 GAMB_MAX_ASK_C    = 95.0     # Preço máximo ASK bruto para entrar. Unidade: Cêntimos. Range: 0.0 - 100.0.
@@ -129,7 +129,7 @@ GAMB_TARGET_BID_C = 0.0      # Preço Bid alvo (0.0 = Market Order). Unidade: US
 
 # --- FILTERS ---
 MAX_SPREAD_CENTS  = 2.20     # Distância máxima permitida entre o melhor Bid e Ask. Unidade: Cêntimos. Range: 0.0 - 100.0.
-BID_ASK_MIN_RATIO = 0.94     # Rácio mínimo de volume Bid/Ask para garantir liquidez bilateral. Unidade: Rácio. Range: 0.0 - 1.0+.
+BID_ASK_MIN_RATIO = 0.96     # Rácio mínimo de volume Bid/Ask para garantir liquidez bilateral. Unidade: Rácio. Range: 0.0 - 1.0+.
 
 # --- HFT ENGINE ---
 HFT_WINDOW_SECONDS   = 10    # Janela temporal para cálculo de métricas (VPIN, OBI). Unidade: Segundos. Range: 1 - 3600.
