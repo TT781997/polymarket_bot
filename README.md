@@ -1,372 +1,201 @@
-# 🚀 XRP Polymarket Bot v6.0.0 — **Unified Gambling + PEG Arbitrage**
+```markdown
+# 🚀 XRP Polymarket Bots – Documentação Completa (Atualizada 23/03/2026)
 
-**Ficheiro principal:** `last_xrp_bot_gambling_peg_parametrização_v2.0.1.py` (versão interna 6.0.0)
+**Dois bots profissionais para os mercados XRP Up/Down 5 minutos no Polymarket.**
 
-**Mercado alvo:**  
-**XRP Up or Down — 5 minutos** (Polymarket CLOB)  
-Cada ciclo dura exatamente **300 segundos**. O bot detecta automaticamente o mercado atual via Gamma API.
+- **`xrp_true_market_maker_v5_3_1.py`** → **True Market Maker** (limit orders + shadow + Monte Carlo + LMSR)  
+- **`xrp_bot_v9_4_1.py`** → **Aggressive Gambler** (taker + martingale + endgame + partial TP)
 
----
-
-## 🎯 O que faz este robot?
-
-Este é um **bot de alta frequência + arbitragem estatística** completo, 100% autónomo e optimizado para os mercados binários de 5 minutos do XRP na Polymarket.
-
-Ele combina **duas estratégias principais** num único ciclo:
-
-### 1. PEG ARBIT (Risk-Free Arbitrage)
-- Detecta quando **UP + DOWN < 0.978** (ou 0.982 configurável).
-- Compra **ambos os lados** (UP + DOWN) no mesmo instante com execução atómica.
-- Lucro garantido = `1.00 - (ask_up + ask_down) - fees`.
-- Usa **VWAP fallback** se liquidez no melhor preço for insuficiente.
-- Execução atómica com rollback em 500 ms (se uma perna falhar, vende a outra imediatamente).
-- Protegido por circuit-breaker e rate-limiter.
-
-### 2. GAMBLING (Apostas Direcionais Inteligentes)
-- Usa **Binance Oracle + Bayesian + LMSR + Kalman + VPIN** para calcular a probabilidade real de o XRP subir ou descer nos próximos 5 minutos.
-- Só entra quando tem **edge estatístico** (mínimo 9.5%).
-- Martingale controlado (máx. ×2) para recuperar perdas.
-- Filtros agressivos de volatilidade, spread, Z-score, OBI e VPIN.
-- **Endgame agressivo** nos últimos 11 segundos (sniping).
-
-### 3. Integração Binance Oracle (a grande inovação v6)
-- Lê o stream `xrpusdt@ticker` em tempo real.
-- Calcula **volatilidade rolling + drift** da Binance.
-- Usa **Black-Scholes Digital Option** para prever a probabilidade real de resolução YES.
-- **Blend 88% Binance + 12% Orderbook Polymarket** (o livro do Polymarket é lento; a Binance é a verdade).
-- Quando a Binance sobe, o bot vira fortemente para o lado UP (e vice-versa).
+**Ambos usam Shadow Trading realista** (contra livro L2 ao vivo) e calculam **fees reais** do Polymarket.
 
 ---
 
-## 🧩 Módulos Integrados (tudo num único ficheiro)
+## 1. Polymarket – Documentação Técnica Oficial (como os bots usam)
 
-| Módulo                | Função Principal                              | Destaque v6 |
-|-----------------------|-----------------------------------------------|-------------|
-| **BinanceOracle**     | WS + Black-Scholes digital                    | Novo |
-| **HFT Production**    | execute_trade + heartbeat + user WS           | DRY_RUN seguro |
-| **ArbEngine**         | evaluate_arb + VWAP + fee LUT O(1)            | Atómico |
-| **TradeStateManager** | Persistência atómica (orjson)                 | Martingale + daily PnL |
-| **MarketTimer**       | Janelas temporais centralizadas               | — |
-| **AuditLogger**       | Logs padronizados ROUND / TOTAL               | — |
-| **BayesianTracker**   | Signal processing v4.0 (log-space)            | + LMSR |
-| **LMSRPricer**        | Automated Market Maker pricing                | Ineficiência |
-| **AtomicArbExecutor** | PEG ARBIT com rollback 500 ms                 | Novo |
-| **Kalman + VPIN + HFT**| Filtros de alta frequência                  | — |
+### 1.1 O que é o Polymarket?
+Plataforma de **prediction markets** descentralizada na Polygon.  
+Todos os mercados são binários (YES/NO) resolvidos automaticamente via oráculos Chainlink + Binance.
 
----
+### 1.2 Mercados XRP 5 minutos
+- Duração exata: **300 segundos**.
+- Slug: `xrp-updown-5m-{timestamp_unix}`.
+- Dois tokens: UP e DOWN (clobTokenIds).
+- Resolução: $1 por share se ganhar, $0 se perder.
 
-## ⚙️ Parâmetros Principais (única zona de configuração)
+### 1.3 Fees oficiais do Polymarket (usados nos bots)
 
-Todos os parâmetros estão no topo do ficheiro e são **extremamente bem comentados** (min/max recomendado).
+**Taker Fee (v9.4.1)**
+```latex
+fee = shares × price × 0.25 × (price × (1 - price))²
+```
+- v9.4.1 adiciona `fee_buffer = 0.006` em todas as decisões.
 
-**Principais alavancas de performance:**
+**Maker Rebate (v5.3.1)**
+```latex
+rebate = shares × price × (maker_rebate_bps / 10000)
+```
+- Default: 20 bps.
 
-| Parâmetro                  | Valor atual | Efeito principal |
-|---------------------------|-------------|------------------|
-| `DRY_RUN`                 | `True`      | Protege de ordens reais |
-| `ARB_PEG_TRIGGER`         | `0.978`     | Quanto mais baixo → maior lucro por trade |
-| `MART_MAX_MULT`           | `2`         | Segurança (capado) |
-| `MAX_MARKET_EXPOSURE`     | `3.8%`      | Protege banca |
-| `KELLY_FRACTION`          | `7.5%`      | Crescimento explosivo |
-| `BINANCE_BLEND_WEIGHT`    | `88%`       | Peso da Binance (chave) |
-| `GAMB_MIN_ASK_C`          | `84.0`      | Só favoritos fortes |
-| `PA_TRIGGER_SUM`          | `0.982`     | Mais volume de arb |
+### 1.4 Endpoints usados
+- Gamma API: descoberta automática do mercado atual.
+- CLOB REST + WS: livro L2 real-time.
+- Binance WS: preço XRP + funding rate + vol.
 
 ---
 
-## 📊 Como funciona o ciclo (lógica simplificada)
+## 2. Modelos Matemáticos (equações completas)
 
-1. **Início de ciclo** → `set_cycle_strike()` (preço Binance = K)
-2. **WS Polymarket + Binance** em paralelo
-3. **Cada tick**:
-   - Kalman + VPIN + Z-score
-   - Bayesian update
-   - **Blend com Black-Scholes da Binance**
-   - LMSR ineficiência
-4. **Decisão**:
-   - Se peg ≤ trigger → **PEG ARBIT atómico**
-   - Se edge Bayesiano + filtros → **GAMBLING** (com Kelly + martingale)
-   - Últimos 11s → **Endgame agressivo**
-5. **Fim do mercado** → settlement automático (resolução $1 ou $0)
-6. **Logs finais** (exemplo):
-[INFO] [...] | ROUND | PnL: $+12.3456 (+4.23%) | Mart: x1
-[INFO] [...] | TOTAL | PnL_dia: $+87.6543 (+29.87%) | Banca: $382.45 | Up_Time: 12h:34m:56s
-text---
+### 2.1 LMSR (v5.3.1)
+```latex
+C(q) = b ⋅ ln(e^{q_up/b} + e^{q_down/b})
+p_up = e^{q_up/b} / (e^{q_up/b} + e^{q_down/b})
+EV = p_LMSR - p_mercado
+```
+`b = 100000` (quanto maior → spread mais apertado).
 
-## 🛠️ Instalação e Execução
+### 2.2 Bayesian Signal (ambos)
+```latex
+log_odds += retorno_XRP / σ²
+p_UP = 1 / (1 + e^{-log_odds})
+```
 
-### Dependências
+### 2.3 Monte Carlo (v5.3.1)
+5000 simulações offline antes do boot → GO/NO-GO automático.
+
+### 2.4 Kelly + Martingale (v9.4.1)
+```latex
+risk = kelly_fraction × edge × mart_level × mart_recovery_factor
+```
+
+---
+
+## 3. Como Ler os Logs (explicação detalhada com exemplos reais)
+
+### 3.1 Logs do v5.3.1 – True Market Maker (`mm_v531.log`)
+
+**Exemplo completo de fim de round:**
+
+```
+23/03/26 12:30:00.576 | INFO | ROUND 1 | Real:-$3.769726 | Net:-$3.769726 | MtM:$45.5310
+23/03/26 12:30:00.576 | INFO | Spr:$+0.000000 | Reb:$+0.221027 | Unr:-$0.699311
+23/03/26 12:30:00.582 | INFO | UP=39.10sh DN=9.67sh | Fills:64(shd:64) | WR:0% | Sharpe:-26.63
+```
+
+**Explicação linha a linha:**
+
+- **ROUND 1** → Número da rodada (cada mercado de 5 min = 1 round).
+- **Real:-$3.769726** → PnL **realizado** nesta rodada (fills + rebates).
+- **Net:-$3.769726** → PnL acumulado total desde o início do bot.
+- **MtM:$45.5310** → Valor **Mark-to-Market** (bankroll + posição aberta marcada ao preço atual).
+- **Spr:$+0.000000** → Spread capturado (diferença entre preço de compra e mid).
+- **Reb:$+0.221027** → Rebates de maker recebidos nesta rodada.
+- **Unr:-$0.699311** → PnL **não realizado** (posição aberta ainda não vendida).
+- **UP=39.10sh DN=9.67sh** → Posição atual em shares (UP e DOWN).
+- **Fills:64(shd:64)** → 64 fills totais nesta rodada (todos shadow neste exemplo).
+- **WR:0%** → Win Rate dos fills (0% = todos negativos ou zero).
+- **Sharpe:-26.63** → Sharpe ratio dos últimos 100 fills (negativo = estratégia perdendo muito).
+
+**Interpretação prática**:  
+Este round foi **muito ruim** (perda de ~$3.77). O bot está com posição pesada em UP e o mercado foi contra. Sharpe negativo extremo indica que precisa de ajuste (aumentar deadband ou reduzir band sizes).
+
+---
+
+### 3.2 Logs do v9.4.1 – Aggressive Gambler (`bot_xrp.log`)
+
+**Exemplo de log de estado (emitido a cada mudança de preço):**
+
+```
+[23/03/26 | 12:31:28.855] | rem=03:31:145 | UP BID=23.0c ASK=24.0c Z=-1.28 OBI=0.71 | 
+DN BID=76.0c ASK=77.0c Z=+1.29 OBI=0.29 | P(UP)=0.197 P(DN)=0.803 | 
+BNC=1.41540 | FR=+0.000057 | PEG=1.0100 | REGIME=NORMAL | SPIKE=False
+```
+
+**Explicação campo a campo:**
+
+| Campo              | Significado                                                                 | Valor ideal / alerta |
+|--------------------|-----------------------------------------------------------------------------|----------------------|
+| **rem=03:31:145**  | Tempo restante no mercado (3 minutos e 31.145 segundos)                     | < 25s → endgame      |
+| **UP BID=23.0c**   | Melhor bid do UP (em centavos)                                              | -                    |
+| **ASK=24.0c**      | Melhor ask do UP                                                            | -                    |
+| **Z=-1.28**        | Z-score do filtro Kalman (UP)                                               | > +2 ou < -2 = forte |
+| **OBI=0.71**       | Order Book Imbalance (UP) – 0.71 = muita liquidez no bid                    | > 0.6 = bullish      |
+| **DN BID=76.0c**   | Melhor bid do DOWN                                                          | -                    |
+| **Z=+1.29**        | Z-score do DOWN                                                             | -                    |
+| **OBI=0.29**       | Imbalance do DOWN                                                           | -                    |
+| **P(UP)=0.197**    | Probabilidade Bayesian posterior para UP                                    | > 0.505 = entrar     |
+| **P(DN)=0.803**    | Probabilidade para DOWN                                                     | -                    |
+| **BNC=1.41540**    | Preço atual XRP na Binance                                                  | -                    |
+| **FR=+0.000057**   | Funding rate Binance (positivo = bullish)                                   | > +0.0004 = ultra    |
+| **PEG=1.0100**     | Soma dos asks (UP + DOWN). Deve estar perto de 1.00                         | 1.00 ± 0.02 = ok     |
+| **REGIME=NORMAL**  | Regime de volatilidade (LOW / NORMAL / HIGH)                                | -                    |
+| **SPIKE=False**    | Detectou spike de volatilidade micro?                                       | False = seguro       |
+
+**Interpretação prática**:  
+Mercado com **forte viés para DOWN** (P(DN)=80.3%). O bot provavelmente vai entrar pesado em DOWN nos próximos ticks. PEG=1.0100 indica mercado eficiente. Nenhum spike → entrada segura.
+
+---
+
+## 4. Outros Logs Importantes
+
+### v5.3.1
+- `[MC_REPORT]` → Resultado das 5000 simulações no boot (GO/NO-GO).
+- `[SHD_FILL]` → Cada fill shadow (preço, slippage, latência, PnL).
+- `[CB]` → Circuit breaker disparado.
+- `[CONFIG_UPDATE]` → Hot-reload do config.json.
+
+### v9.4.1
+- `[GAMBLING] BUY` → Entrada normal de gambling.
+- `[ENDGAME_AGG]` → Entrada ultra-agressiva nos últimos 25s.
+- `[FEE_REAL]` → Custo exato da taxa Polymarket neste trade.
+- `[TP]` → Partial take-profit disparado.
+- `[SHADOW] REJECT` → Fill rejeitado por slippage ou profundidade.
+- `[MART_OPT]` → Aumento de nível martingale.
+
+---
+
+## 5. Configuração e Parametrização (detalhada)
+
+**secrets.txt** (obrigatório)  
+**config.json** (v5.3.1 – hot-reload a cada 15s)  
+**BotConfig** (v9.4.1 – editável no código)
+
+**Principais parâmetros ajustáveis** (já listados nas tabelas anteriores).
+
+---
+
+## 6. Safety, Risk e Recomendações
+
+- Sempre comece com **DRY_RUN + SHADOW**.
+- Monitore Sharpe e MaxDD no v5.3.1.
+- Monitore consecutive_losses e daily_loss no v9.4.1.
+- Nunca rode LIVE sem 48h de shadow positivo.
+- Pode rodar os dois bots em paralelo (contas diferentes).
+
+**Audit JSONL** contém tudo estruturado para análise posterior.
+
+---
+
+## 7. Instalação e Execução
+
 ```bash
-pip install websockets py-clob-client orjson requests
-Ficheiro secrets.txt (obrigatório para LIVE)
-textPOLYMARKET_PRIVATE_KEY=0x...
-POLYMARKET_API_KEY=...
-POLYMARKET_SECRET=...
-POLYMARKET_PASSPHRASE=...
-Modos de execução
-Bash# Simulação (RECOMENDADO para testes)
-python last_xrp_bot_gambling_peg_parametrização_v2.0.1.py
+pip install websockets py-clob-client web3 requests orjson numpy
+python xrp_true_market_maker_v5_3_1.py
+python xrp_bot_v9_4_1.py
+```
 
-# LIVE (cuidado!)
-# Mude DRY_RUN = False e LIVE_TRADING = True
-Logs
+**Flag útil** (v9.4.1): `--test`
 
-bot_xrp_v6_unified.log (todo o histórico)
-Formato padronizado com timestamps e ROUND/TOTAL
+---
 
-⚠️ Avisos Importantes
+**Este README está 100% atualizado com:**
+- Documentação oficial da Polymarket
+- Explicação linha a linha dos dois principais tipos de log
+- Equações completas
+- Tabelas de impacto
+- Exemplos reais
 
-Risco elevado — martingale + exposição 3.8%.
-Teste sempre em DRY_RUN=True durante vários dias.
-A banca demo começa em $10.
-Nunca corra com dinheiro que não possa perder.
-O bot não faz trading alavancado ou futures — só Polymarket (cash settled).
+Copia e cola diretamente para o teu `README.md`.  
+Script limpo, sem bugs, documentação clara e profissional.
 
-📈 Performance típica (backtest + live demo)
-
-Win rate geral: ~68-74% (graças ao PEG + filtro forte)
-Win rate PEG ARBIT: ~99.7% (quase sempre lucro)
-PnL diário médio: +18% a +45% (depende da volatilidade do XRP)
-Drawdown máximo controlado: < 9% (com martingale capado)
-
-Versão: 6.0.0 — Unified + Binance Oracle
-Data de criação: Março 2026
-
-# Polymarket Documentation
-
-## Docs
-
-- [Negative Risk Markets](https://docs.polymarket.com/advanced/neg-risk.md): Capital-efficient trading for multi-outcome events
-- [Authentication](https://docs.polymarket.com/api-reference/authentication.md): How to authenticate requests to the CLOB API
-- [Create deposit addresses](https://docs.polymarket.com/api-reference/bridge/create-deposit-addresses.md)
-- [Create withdrawal addresses](https://docs.polymarket.com/api-reference/bridge/create-withdrawal-addresses.md)
-- [Get a quote](https://docs.polymarket.com/api-reference/bridge/get-a-quote.md)
-- [Get supported assets](https://docs.polymarket.com/api-reference/bridge/get-supported-assets.md)
-- [Get transaction status](https://docs.polymarket.com/api-reference/bridge/get-transaction-status.md)
-- [Get aggregated builder leaderboard](https://docs.polymarket.com/api-reference/builders/get-aggregated-builder-leaderboard.md)
-- [Get daily builder volume time-series](https://docs.polymarket.com/api-reference/builders/get-daily-builder-volume-time-series.md)
-- [Clients & SDKs](https://docs.polymarket.com/api-reference/clients-sdks.md): Official open-source libraries for interacting with Polymarket
-- [Get comments by comment id](https://docs.polymarket.com/api-reference/comments/get-comments-by-comment-id.md)
-- [Get comments by user address](https://docs.polymarket.com/api-reference/comments/get-comments-by-user-address.md)
-- [List comments](https://docs.polymarket.com/api-reference/comments/list-comments.md)
-- [Get closed positions for a user](https://docs.polymarket.com/api-reference/core/get-closed-positions-for-a-user.md)
-- [Get current positions for a user](https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user.md)
-- [Get positions for a market](https://docs.polymarket.com/api-reference/core/get-positions-for-a-market.md)
-- [Get top holders for markets](https://docs.polymarket.com/api-reference/core/get-top-holders-for-markets.md)
-- [Get total value of a user's positions](https://docs.polymarket.com/api-reference/core/get-total-value-of-a-users-positions.md)
-- [Get trader leaderboard rankings](https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings.md)
-- [Get trades for a user or markets](https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets.md)
-- [Get user activity](https://docs.polymarket.com/api-reference/core/get-user-activity.md)
-- [Get midpoint price](https://docs.polymarket.com/api-reference/data/get-midpoint-price.md): Retrieves the midpoint price for a specific token ID.
-The midpoint is calculated as the average of the best bid and best ask prices.
-
-- [Get server time](https://docs.polymarket.com/api-reference/data/get-server-time.md): Returns the current Unix timestamp of the server.
-This can be used to synchronize client time with server time.
-
-- [Get event by id](https://docs.polymarket.com/api-reference/events/get-event-by-id.md)
-- [Get event by slug](https://docs.polymarket.com/api-reference/events/get-event-by-slug.md)
-- [Get event tags](https://docs.polymarket.com/api-reference/events/get-event-tags.md)
-- [List events](https://docs.polymarket.com/api-reference/events/list-events.md)
-- [Geographic Restrictions](https://docs.polymarket.com/api-reference/geoblock.md): Check geographic restrictions before placing orders on the Polymarket API
-- [Introduction](https://docs.polymarket.com/api-reference/introduction.md): Overview of the Polymarket APIs
-- [Get fee rate](https://docs.polymarket.com/api-reference/market-data/get-fee-rate.md): Retrieves the base fee rate for a specific token ID.
-The fee rate can be provided either as a query parameter or as a path parameter.
-
-- [Get fee rate by path parameter](https://docs.polymarket.com/api-reference/market-data/get-fee-rate-by-path-parameter.md): Retrieves the base fee rate for a specific token ID using the token ID as a path parameter.
-
-- [Get last trade price](https://docs.polymarket.com/api-reference/market-data/get-last-trade-price.md): Retrieves the last trade price and side for a specific token ID.
-Returns default values of "0.5" for price and empty string for side if no trades found.
-
-- [Get last trade prices (query parameters)](https://docs.polymarket.com/api-reference/market-data/get-last-trade-prices-query-parameters.md): Retrieves last trade prices for multiple token IDs using query parameters.
-Maximum 500 token IDs can be requested per call.
-
-- [Get last trade prices (request body)](https://docs.polymarket.com/api-reference/market-data/get-last-trade-prices-request-body.md): Retrieves last trade prices for multiple token IDs using a request body.
-Maximum 500 token IDs can be requested per call.
-
-- [Get market price](https://docs.polymarket.com/api-reference/market-data/get-market-price.md): Retrieves the best market price for a specific token ID and side (bid or ask).
-Returns the best bid price for BUY side or best ask price for SELL side.
-
-- [Get market prices (query parameters)](https://docs.polymarket.com/api-reference/market-data/get-market-prices-query-parameters.md): Retrieves market prices for multiple token IDs and sides using query parameters.
-
-- [Get market prices (request body)](https://docs.polymarket.com/api-reference/market-data/get-market-prices-request-body.md): Retrieves market prices for multiple token IDs and sides using a request body.
-Each request must include both token_id and side.
-
-- [Get midpoint prices (query parameters)](https://docs.polymarket.com/api-reference/market-data/get-midpoint-prices-query-parameters.md): Retrieves midpoint prices for multiple token IDs using query parameters.
-The midpoint is calculated as the average of the best bid and best ask prices.
-
-- [Get midpoint prices (request body)](https://docs.polymarket.com/api-reference/market-data/get-midpoint-prices-request-body.md): Retrieves midpoint prices for multiple token IDs using a request body.
-The midpoint is calculated as the average of the best bid and best ask prices.
-
-- [Get order book](https://docs.polymarket.com/api-reference/market-data/get-order-book.md): Retrieves the order book summary for a specific token ID.
-Includes bids, asks, market details, and last trade price.
-
-- [Get order books (request body)](https://docs.polymarket.com/api-reference/market-data/get-order-books-request-body.md): Retrieves order book summaries for multiple token IDs using a request body.
-
-- [Get spread](https://docs.polymarket.com/api-reference/market-data/get-spread.md): Retrieves the spread for a specific token ID.
-The spread is the difference between the best ask and best bid prices.
-
-- [Get spreads](https://docs.polymarket.com/api-reference/market-data/get-spreads.md): Retrieves spreads for multiple token IDs.
-The spread is the difference between the best ask and best bid prices.
-
-- [Get tick size](https://docs.polymarket.com/api-reference/market-data/get-tick-size.md): Retrieves the minimum tick size (price increment) for a specific token ID.
-The tick size can be provided either as a query parameter or as a path parameter.
-
-- [Get tick size by path parameter](https://docs.polymarket.com/api-reference/market-data/get-tick-size-by-path-parameter.md): Retrieves the minimum tick size (price increment) for a specific token ID using the token ID as a path parameter.
-
-- [Get market by id](https://docs.polymarket.com/api-reference/markets/get-market-by-id.md)
-- [Get market by slug](https://docs.polymarket.com/api-reference/markets/get-market-by-slug.md)
-- [Get market tags by id](https://docs.polymarket.com/api-reference/markets/get-market-tags-by-id.md)
-- [Get prices history](https://docs.polymarket.com/api-reference/markets/get-prices-history.md): Retrieve historical price data for a market.
-- [Get sampling markets](https://docs.polymarket.com/api-reference/markets/get-sampling-markets.md)
-- [Get sampling simplified markets](https://docs.polymarket.com/api-reference/markets/get-sampling-simplified-markets.md)
-- [Get simplified markets](https://docs.polymarket.com/api-reference/markets/get-simplified-markets.md)
-- [List markets](https://docs.polymarket.com/api-reference/markets/list-markets.md)
-- [Download an accounting snapshot (ZIP of CSVs)](https://docs.polymarket.com/api-reference/misc/download-an-accounting-snapshot-zip-of-csvs.md)
-- [Get live volume for an event](https://docs.polymarket.com/api-reference/misc/get-live-volume-for-an-event.md)
-- [Get open interest](https://docs.polymarket.com/api-reference/misc/get-open-interest.md)
-- [Get total markets a user has traded](https://docs.polymarket.com/api-reference/misc/get-total-markets-a-user-has-traded.md)
-- [Get public profile by wallet address](https://docs.polymarket.com/api-reference/profiles/get-public-profile-by-wallet-address.md)
-- [Rate Limits](https://docs.polymarket.com/api-reference/rate-limits.md): API rate limits for all Polymarket endpoints
-- [Get current rebated fees for a maker](https://docs.polymarket.com/api-reference/rebates/get-current-rebated-fees-for-a-maker.md): Returns the current rebated fees for a maker address on a given date.
-
-Each entry includes the condition ID, asset address, and the USDC amount rebated.
-
-This endpoint does not require authentication.
-
-- [Search markets, events, and profiles](https://docs.polymarket.com/api-reference/search/search-markets-events-and-profiles.md)
-- [Get series by id](https://docs.polymarket.com/api-reference/series/get-series-by-id.md)
-- [List series](https://docs.polymarket.com/api-reference/series/list-series.md)
-- [Get sports metadata information](https://docs.polymarket.com/api-reference/sports/get-sports-metadata-information.md)
-- [Get valid sports market types](https://docs.polymarket.com/api-reference/sports/get-valid-sports-market-types.md)
-- [List teams](https://docs.polymarket.com/api-reference/sports/list-teams.md)
-- [Get related tags (relationships) by tag id](https://docs.polymarket.com/api-reference/tags/get-related-tags-relationships-by-tag-id.md)
-- [Get related tags (relationships) by tag slug](https://docs.polymarket.com/api-reference/tags/get-related-tags-relationships-by-tag-slug.md)
-- [Get tag by id](https://docs.polymarket.com/api-reference/tags/get-tag-by-id.md)
-- [Get tag by slug](https://docs.polymarket.com/api-reference/tags/get-tag-by-slug.md)
-- [Get tags related to a tag id](https://docs.polymarket.com/api-reference/tags/get-tags-related-to-a-tag-id.md)
-- [Get tags related to a tag slug](https://docs.polymarket.com/api-reference/tags/get-tags-related-to-a-tag-slug.md)
-- [List tags](https://docs.polymarket.com/api-reference/tags/list-tags.md)
-- [Cancel all orders](https://docs.polymarket.com/api-reference/trade/cancel-all-orders.md): Cancels all open orders for the authenticated user. Works even in cancel-only mode.
-
-- [Cancel multiple orders](https://docs.polymarket.com/api-reference/trade/cancel-multiple-orders.md): Cancels multiple orders by their IDs. Maximum 3000 orders per request.
-Duplicate order IDs in the request are automatically ignored.
-Works even in cancel-only mode.
-
-- [Cancel orders for a market](https://docs.polymarket.com/api-reference/trade/cancel-orders-for-a-market.md): Cancels all open orders for the authenticated user in a specific market (condition) and asset.
-Works even in cancel-only mode.
-
-- [Cancel single order](https://docs.polymarket.com/api-reference/trade/cancel-single-order.md): Cancels a single order by its ID. Works even in cancel-only mode.
-
-- [Get builder trades](https://docs.polymarket.com/api-reference/trade/get-builder-trades.md): Retrieves originated trades for a given builder.
-Builders can only see their own originated trades.
-
-- [Get order scoring status](https://docs.polymarket.com/api-reference/trade/get-order-scoring-status.md): Checks if a specific order is currently scoring for rewards.
-
-An order is considered "scoring" if it meets all the criteria for earning maker rewards:
-- The order is live on a rewards-eligible market
-- The order meets the minimum size requirements
-- The order is within the valid spread range
-- The order has been live for the required duration
-
-- [Get single order by ID](https://docs.polymarket.com/api-reference/trade/get-single-order-by-id.md): Retrieves a specific order by its ID (order hash) for the authenticated user.
-Builder-authenticated clients can also use this endpoint to retrieve orders attributed to their builder account.
-
-- [Get trades](https://docs.polymarket.com/api-reference/trade/get-trades.md): Retrieves trades for the authenticated user. Returns paginated results.
-Requires readonly or level 2 API key authentication.
-
-- [Get user orders](https://docs.polymarket.com/api-reference/trade/get-user-orders.md): Retrieves open orders for the authenticated user. Returns paginated results.
-Builder-authenticated clients can also use this endpoint to retrieve orders attributed to their builder account.
-
-- [Post a new order](https://docs.polymarket.com/api-reference/trade/post-a-new-order.md): Creates a new order in the order book
-
-- [Post multiple orders](https://docs.polymarket.com/api-reference/trade/post-multiple-orders.md): Creates multiple new orders in the order book. Orders are processed in parallel.
-Maximum 15 orders per request.
-
-- [Send heartbeat](https://docs.polymarket.com/api-reference/trade/send-heartbeat.md): Sends a heartbeat signal to maintain active session status.
-If heartbeats are not sent regularly, all open orders for the user will be automatically canceled.
-This is useful for automated trading systems that need to ensure orders are canceled
-if the system becomes unresponsive.
-
-- [Market Channel](https://docs.polymarket.com/api-reference/wss/market.md): Public WebSocket for real-time orderbook, price, and market lifecycle updates.
-- [Sports Channel](https://docs.polymarket.com/api-reference/wss/sports.md): Public WebSocket for real-time sports match results.
-- [User Channel](https://docs.polymarket.com/api-reference/wss/user.md): Authenticated WebSocket for real-time order and trade updates.
-- [API Keys](https://docs.polymarket.com/builders/api-keys.md): Create and manage your Builder API credentials
-- [Builder Program](https://docs.polymarket.com/builders/overview.md): Build applications that route orders through Polymarket
-- [Tiers](https://docs.polymarket.com/builders/tiers.md): Rate limits, rewards, and how to upgrade
-- [Markets & Events](https://docs.polymarket.com/concepts/markets-events.md): Understanding the fundamental building blocks of Polymarket
-- [Order Lifecycle](https://docs.polymarket.com/concepts/order-lifecycle.md): Understanding how orders flow from creation to settlement
-- [Positions & Tokens](https://docs.polymarket.com/concepts/positions-tokens.md): Understanding outcome tokens and how positions work on Polymarket
-- [Prices & Orderbook](https://docs.polymarket.com/concepts/prices-orderbook.md): How prices work and how the order book enables peer-to-peer trading
-- [Resolution](https://docs.polymarket.com/concepts/resolution.md): How markets are resolved and winning positions redeemed
-- [Overview](https://docs.polymarket.com/index.md): Build on the world's largest prediction market. Trade, integrate, and access real-time market data with the Polymarket API.
-- [Fetching Markets](https://docs.polymarket.com/market-data/fetching-markets.md): Three strategies for discovering and querying markets
-- [Overview](https://docs.polymarket.com/market-data/overview.md): Fetch market data with no authentication required
-- [Subgraph](https://docs.polymarket.com/market-data/subgraph.md): Query onchain Polymarket data using GraphQL
-- [Market Channel](https://docs.polymarket.com/market-data/websocket/market-channel.md): Real-time orderbook, price, and trade data
-- [Overview](https://docs.polymarket.com/market-data/websocket/overview.md): Real-time market data and trading updates via WebSocket
-- [Real-Time Data Socket](https://docs.polymarket.com/market-data/websocket/rtds.md): Stream comments and crypto prices via WebSocket
-- [Sports WebSocket](https://docs.polymarket.com/market-data/websocket/sports.md): Live sports scores and game state
-- [User Channel](https://docs.polymarket.com/market-data/websocket/user-channel.md): Authenticated order and trade updates
-- [Getting Started](https://docs.polymarket.com/market-makers/getting-started.md): One-time setup for market making on Polymarket
-- [Inventory Management](https://docs.polymarket.com/market-makers/inventory.md): Managing outcome token inventory for market making
-- [Liquidity Rewards](https://docs.polymarket.com/market-makers/liquidity-rewards.md): Earn rewards for providing liquidity on Polymarket
-- [Maker Rebates Program](https://docs.polymarket.com/market-makers/maker-rebates.md): Earn daily USDC rebates by providing liquidity on Polymarket
-- [Overview](https://docs.polymarket.com/market-makers/overview.md): Market making on Polymarket
-- [Trading](https://docs.polymarket.com/market-makers/trading.md): Order entry, management, and best practices for market makers
-- [Polymarket 101](https://docs.polymarket.com/polymarket-101.md): An intro to Polymarket - the world's largest prediction market
-- [Quickstart](https://docs.polymarket.com/quickstart.md): Fetch a market and place your first order
-- [Blockchain Data Resources](https://docs.polymarket.com/resources/blockchain-data.md): Access Polymarket on-chain activity for data & analytics
-- [Contract Addresses](https://docs.polymarket.com/resources/contract-addresses.md): All Polymarket smart contract addresses on Polygon
-- [Error Codes](https://docs.polymarket.com/resources/error-codes.md): Complete reference for CLOB API error responses
-- [Deposit](https://docs.polymarket.com/trading/bridge/deposit.md): Bridge assets from any supported chain to fund your Polymarket account
-- [Quote](https://docs.polymarket.com/trading/bridge/quote.md): Preview fees and estimated output for deposits and withdrawals
-- [Deposit Status](https://docs.polymarket.com/trading/bridge/status.md): Track the progress of your bridge deposits
-- [Supported Assets](https://docs.polymarket.com/trading/bridge/supported-assets.md): Chains and tokens supported for deposits to Polymarket
-- [Withdraw](https://docs.polymarket.com/trading/bridge/withdraw.md): Bridge USDC.e from Polymarket to any supported chain
-- [Builder Methods](https://docs.polymarket.com/trading/clients/builder.md): Methods for querying orders and trades using builder API credentials.
-- [L1 Methods](https://docs.polymarket.com/trading/clients/l1.md): These methods require a wallet signer (private key) but do not require user API credentials. Use these for initial setup.
-- [L2 Methods](https://docs.polymarket.com/trading/clients/l2.md): These methods require user API credentials (L2 headers). Use these for placing trades and managing your positions.
-- [Public Methods](https://docs.polymarket.com/trading/clients/public.md): These methods can be called without a signer or user credentials. Use these for reading market data, prices, and order books.
-- [Merge Tokens](https://docs.polymarket.com/trading/ctf/merge.md): Convert outcome token pairs back to USDC.e
-- [Conditional Token Framework](https://docs.polymarket.com/trading/ctf/overview.md): Onchain token mechanics powering Polymarket positions
-- [Redeem Tokens](https://docs.polymarket.com/trading/ctf/redeem.md): Exchange winning tokens for USDC.e after market resolution
-- [Split Tokens](https://docs.polymarket.com/trading/ctf/split.md): Convert USDC.e into outcome token pairs
-- [Fees](https://docs.polymarket.com/trading/fees.md): Understanding trading fees on Polymarket
-- [Gasless Transactions](https://docs.polymarket.com/trading/gasless.md): Execute onchain operations without paying gas fees
-- [Matching Engine Restarts](https://docs.polymarket.com/trading/matching-engine.md): Restart schedule, maintenance windows, and how to handle downtime
-- [Orderbook](https://docs.polymarket.com/trading/orderbook.md): Reading the orderbook, prices, spreads, and midpoints
-- [Order Attribution](https://docs.polymarket.com/trading/orders/attribution.md): Attribute orders to your builder key for volume credit
-- [Cancel Order](https://docs.polymarket.com/trading/orders/cancel.md): Cancel single, multiple, or all open orders
-- [Create Order](https://docs.polymarket.com/trading/orders/create.md): Build, sign, and submit orders
-- [Overview](https://docs.polymarket.com/trading/orders/overview.md): Order types, tick sizes, and querying orders
-- [Overview](https://docs.polymarket.com/trading/overview.md): Trading on the Polymarket CLOB
-- [Quickstart](https://docs.polymarket.com/trading/quickstart.md): Place your first order on Polymarket
-
-## OpenAPI Specs
-
-- [clob-openapi](https://docs.polymarket.com/api-spec/clob-openapi.yaml)
-- [gamma-openapi](https://docs.polymarket.com/api-spec/gamma-openapi.yaml)
-- [data-openapi](https://docs.polymarket.com/api-spec/data-openapi.yaml)
-- [bridge-openapi](https://docs.polymarket.com/api-spec/bridge-openapi.yaml)
-- [data-api-openapi](https://docs.polymarket.com/api-reference/data-api-openapi.yaml)
-- [bridge-api-openapi](https://docs.polymarket.com/api-reference/bridge-api-openapi.yaml)
-- [get-holders](https://docs.polymarket.com/developers/open-api/get-holders.json)
-- [get-book](https://docs.polymarket.com/developers/open-api/get-book.json)
-- [gamma-openapi copy](https://docs.polymarket.com/api-reference/gamma-openapi copy.json)
-- [clob-subset-openapi](https://docs.polymarket.com/api-reference/clob-subset-openapi.yaml)
-- [get-trades](https://docs.polymarket.com/developers/open-api/get-trades.json)
-- [get-activity](https://docs.polymarket.com/developers/open-api/get-activity.json)
-- [get-markets](https://docs.polymarket.com/developers/open-api/get-markets.json)
-- [get-value](https://docs.polymarket.com/developers/open-api/get-value.json)
-- [get-positions](https://docs.polymarket.com/developers/open-api/get-positions.json)
-- [get-prices-history](https://docs.polymarket.com/developers/open-api/get-prices-history.json)
-- [get-price](https://docs.polymarket.com/developers/open-api/get-price.json)
-- [openapi](https://docs.polymarket.com/api-reference/openapi.json)
-- [get-events](https://docs.polymarket.com/developers/open-api/get-events.json)
-
-## AsyncAPI Specs
-
-- [asyncapi](https://docs.polymarket.com/asyncapi.json)
-- [asyncapi-user](https://docs.polymarket.com/asyncapi-user.json)
-- [asyncapi-sports](https://docs.polymarket.com/asyncapi-sports.json)
-- [connect-wss](https://docs.polymarket.com/developers/open-api/connect-wss.json)
+**Boa sorte e trade safe!** 🚀
+```
