@@ -1,22 +1,21 @@
 """
-xrp_bot_v9_4_0.py -- Polymarket XRP Up/Down 5-Minute
-VERSION: 9.4.0 -- CLEAN + UNIFORM_VOL + MAX_AGGRESSIVE + FEE_REAL
+xrp_bot_v9_5_3.py -- Polymarket XRP Up/Down 5-Minute
+VERSION: 9.5.3 -- MOONBAG_TP + RELAXED_STOPLOSS + COOLDOWN_12s
 
-Changes from v9.3.x:
-1. [FEE_REAL]    All edge/PnL/sizing use real Polymarket fee (0.25*exp2), gas=0.
-                 Fee buffer 0.006 applied. Mandatory [FEE_REAL] log per entry.
-2. [SYNTH_REMOVED] 100% removal of Synthetic PEG: create_synthetic_peg_orders,
-3. [DEAD_CODE]   Removed OrderBookAnalyzer, LMSRPricer, AtomicArbExecutor,
-                 CorrelationTracker and all orphan code.
-4. [UNIFORM_VOL] Vol regime detection kept for logging only. No differentiation
-                 in entries/sizing/kelly across LOW/NORMAL/HIGH.
-5. [MAX_AGG]     min_prob_entry=0.505, min_vwap_edge=0.005, gamb_min_ask_c=50.0,
-                 gamb_max_ask_c=97.0, kelly_fraction=0.48, kelly_max_risk_pct=0.065,
-                 max_market_exposure=0.28, max_bankroll_exposure=0.58,
-                 max_position_size_usd=14.5, mart_max_mult=4.
-
-Core retained: Gambling, Endgame, Bayesian, Kalman, Binance oracle, Martingale,
-               PnL refined, Safety, PEG ARB.
+Changes from v9.5.2:
+1. [MOONBAG_TP]  Risk-Free Moonbag Take Profit: instead of selling a fixed 80%,
+                 the bot sells the MINIMUM shares needed to recover 100% of the
+                 invested capital (shares_to_sell = total_out / bid_now).
+                 Only fires if shares_to_sell <= 80% of position.
+                 Result: remaining shares are pure risk-free profit ("moonbag")
+                 that ride to market close for $1.00 or $0.00.
+                 At high bids (0.90-0.98), sells only 65-75% instead of 80%.
+2. [STOPLOSS]    max_loss_per_trade_pct relaxed from 0.15 to 0.40 (40%).
+                 Gives trades more room to recover before forced exit.
+3. [COOLDOWN]    gamb_buy_cooldown increased from 6.0s to 12.0s.
+                 Reduces overtrading and improves entry quality.
+4. [INHERITED]   All v9.5.2 systems: VOL_HEDGE, Shadow Engine, PEG ARB,
+                 Bayesian/Kalman, Martingale, HEDGE_FLIP, logging unchanged.
 """
 from __future__ import annotations
 ###############################################################################
@@ -31,7 +30,6 @@ import logging
 import logging.handlers
 import math
 import os
-import pathlib
 import queue
 import random
 import signal
@@ -44,7 +42,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -115,9 +113,293 @@ def _load_secrets_file(path: str = "secrets.txt") -> Dict[str, str]:
             secrets[k.strip()] = v.strip()
     return secrets
 
+###############################################################################
+# PARAMETER GUIDE -- v9.4.3
+# Cada parâmetro tem: descrição, unidade, [min..max], efeito ↑/↓
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# SIZING & RISCO (controlam tamanho das posições e perdas máximas)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# kelly_max_risk_pct         | fração | [0.005 .. 0.15]
+#   % máxima do bankroll numa única posição.
+#   ↑ = posições maiores, mais profit mas mais risco por trade.
+#   ↓ = posições menores, perda máxima por trade reduzida.
+#   REGRA: se queres max 1% loss → usa 0.01.
+#
+# kelly_fraction             | fração | [0.10 .. 0.50]
+#   Fração do Kelly completo usado no cálculo de sizing.
+#   ↑ = closer to full Kelly, mais agressivo.
+#   ↓ = "fractional Kelly", mais conservador.
+#
+# kelly_assumed_edge         | fração | [0.01 .. 0.10]
+#   Edge assumido no cálculo de Kelly para boost em Martingale.
+#   ↑ = boost de stake mais agressivo quando edge > assumed.
+#   ↓ = boost mais fácil de trigger.
+#
+# kelly_mart_boost           | fração | [0.0 .. 0.50]
+#   Multiplicador extra no stake quando edge > assumed_edge * 1.2.
+#   ↑ = recovery mais rápida em Martingale mas mais risco.
+#   ↓ = recovery mais lenta mas mais segura.
+#
+# max_market_exposure        | fração | [0.10 .. 0.50]
+#   % máxima do bankroll em todas as posições abertas combinadas.
+#   ↑ = mais capital em risco simultâneo.
+#   ↓ = limita exposição total.
+#
+# max_bankroll_exposure      | fração | [0.20 .. 0.80]
+#   Hard cap de exposição total do bankroll.
+#   ↑ = permite quase todo o bankroll em posições.
+#   ↓ = reserva mais cash.
+#
+# max_position_size_usd      | USD | [1.0 .. 10000.0]
+#   Tamanho máximo absoluto em USD de uma posição.
+#   ↑ = sem limitar banca crescente (usar valor alto).
+#   ↓ = hard cap que bloqueia trades grandes (cuidado com Mart).
+#
+# max_active_trades          | count | [1 .. 20]
+#   Nº máximo de trades abertos em simultâneo.
+#   ↑ = mais posições paralelas.
+#   ↓ = menos, mais focado.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# MARTINGALE (recovery de perdas consecutivas)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# mart_max_mult              | multiplicador | [1 .. 5]
+#   Multiplicador máximo de Martingale (1=desligado).
+#   ↑ = recovery mais agressiva mas risco de ruin muito maior.
+#   ↓ = mais seguro, recovery mais lenta.
+#
+# mart_recovery_factor       | multiplicador | [1.00 .. 1.50]
+#   Amplifica o stake em modo Martingale.
+#   ↑ = stakes maiores em recovery → mais risco.
+#   ↓ = stakes normais em recovery.
+#
+# max_consecutive_losses     | count | [2 .. 10]
+#   Nº de perdas seguidas antes de pausar trading (safety halt).
+#   ↑ = mais tolerante a streaks.
+#   ↓ = para mais cedo (protege bankroll).
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# LIMITES DIÁRIOS / HORÁRIOS (circuit breakers)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# max_daily_loss_pct         | % | [5.0 .. 100.0]
+#   % máxima de perda diária antes de parar.
+#   ↑ = mais tolerante (arriscado).
+#   ↓ = para cedo, protege capital.
+#
+# max_hourly_loss_pct        | % | [5.0 .. 50.0]
+#   % máxima de perda por hora antes de pausar.
+#   ↑ = mais tolerante.
+#   ↓ = pausa mais rápido em drawdowns.
+#
+# hourly_pause_duration_s    | segundos | [60 .. 3600]
+#   Tempo de pausa depois de atingir limite horário.
+#   ↑ = pausa mais longa.
+#   ↓ = retoma mais rápido.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# GAMBLING (estratégia principal de entrada)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# gambling_active            | bool | True/False
+#   Liga/desliga o módulo Gambling.
+#
+# gamb_start_rem_s           | segundos | [30 .. 300]
+#   Tempo restante no ciclo para começar a entrar.
+#   ↑ = entra mais cedo (mais tempo para entrar).
+#   ↓ = só entra nos últimos segundos.
+#
+# gamb_cutoff_s              | segundos | [5 .. 60]
+#   Tempo mínimo restante para permitir entrada.
+#   ↑ = para de entrar mais cedo.
+#   ↓ = entra até mais perto do fim.
+#
+# gamb_buy_cooldown          | segundos | [1.0 .. 30.0]
+#   Cooldown mínimo entre compras do mesmo lado.
+#   ↑ = menos entradas (espaçadas).
+#   ↓ = mais entradas (mais rápido).
+#
+# gamb_min_ask_c             | cêntimos | [30.0 .. 60.0]
+#   Ask mínimo (em cêntimos) para entrar. Ex: 45 = 0.45.
+#   ↑ = só entra em asks altos (mais "certo", menos payout).
+#   ↓ = entra em asks baixos (mais risco, mais payout).
+#
+# gamb_max_ask_c             | cêntimos | [80.0 .. 99.0]
+#   Ask máximo (em cêntimos) para entrar.
+#   ↑ = permite asks muito altos (caro).
+#   ↓ = evita asks caros.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# FILTROS DE ENTRADA (determinam WIN RATE)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# min_prob_entry             | probabilidade | [0.50 .. 0.70]
+#   Probabilidade mínima P(side) para entrar.
+#   ↑ = menos entradas mas maior WR (mais selectivo).
+#   ↓ = mais entradas mas menor WR.
+#
+# min_vwap_edge              | fração | [0.001 .. 0.05]
+#   Edge mínimo (P_hat - VWAP_ask - fees) para entrar.
+#   ↑ = só entra com edge grande → maior WR, menos trades.
+#   ↓ = entra com edge pequeno → mais trades, menor WR.
+#
+# es_min_threshold           | z-score | [1.0 .. 4.0]
+#   Edge Score mínimo do VolatilityEdgeTracker.
+#   ↑ = filtro mais rigoroso → menos trades, maior WR.
+#   ↓ = filtro mais solto → mais trades.
+#
+# max_spread_cents           | cêntimos | [0.5 .. 3.0]
+#   Spread máximo (ask-bid) em cêntimos para entrar.
+#   ↑ = permite spreads maiores (mais entradas).
+#   ↓ = só entra em spreads apertados (melhor preço).
+#
+# bid_ask_min_ratio          | ratio | [0.90 .. 0.999]
+#   Rácio mínimo bid/ask para entrar.
+#   ↑ = exige preços mais apertados.
+#   ↓ = permite mais discrepância.
+#
+# fee_buffer                 | fração | [0.002 .. 0.015]
+#   Buffer de fee subtraído em todos os cálculos de edge.
+#   ↑ = mais conservador (edge precisa ser maior).
+#   ↓ = menos conservador.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# ENDGAME (últimos segundos do ciclo de 5 min)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# aggressive_endgame_active  | bool | True/False
+#   Liga/desliga entrada agressiva no endgame.
+#
+# aggressive_endgame_s       | segundos | [10 .. 45]
+#   Últimos N segundos que activam endgame.
+#   ↑ = endgame começa mais cedo.
+#   ↓ = só nos últimos segundos.
+#
+# aggressive_endgame_risk    | fração | [0.01 .. 0.15]
+#   Risk % base para trades de endgame.
+#   ↑ = posições endgame maiores.
+#   ↓ = endgame mais conservador.
+#
+# endgame_high_z_risk        | fração | [0.01 .. 0.15]
+#   Risk % quando Z-score é alto (alta convicção).
+#   ↑ = mais agressivo em sinais fortes.
+#   ↓ = mais conservador mesmo em sinais fortes.
+#
+# endgame_high_z_thresh      | z-score | [1.5 .. 4.0]
+#   Limiar de Z-score para activar high_z_risk.
+#   ↑ = precisa de sinal mais forte.
+#   ↓ = activa com sinais mais fracos.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# PEG ARB (arbitragem quando ask_UP + ask_DOWN < 1.00)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# peg_arb_active             | bool | True/False
+#   Liga/desliga o módulo PEG ARB.
+#
+# peg_trigger                | preço | [0.95 .. 0.995]
+#   PEG máximo (ask_up + ask_down) para trigger de arb.
+#   ↑ = mais oportunidades (PEG pode ser mais alto).
+#   ↓ = mais selectivo, só PEGs muito baixos (mais lucro).
+#
+# peg_budget_pct             | fração | [0.01 .. 0.10]
+#   % do bankroll alocado por operação de PEG ARB.
+#   ↑ = posições arb maiores.
+#   ↓ = posições arb menores.
+#
+# peg_cooldown_s             | segundos | [2.0 .. 30.0]
+#   Cooldown mínimo entre operações PEG ARB.
+#   ↑ = menos operações.
+#   ↓ = mais operações.
+#
+# peg_min_profit_pct         | % | [0.1 .. 2.0]
+#   Lucro mínimo % para executar PEG ARB (após fees).
+#   ↑ = só arb muito lucrativo.
+#   ↓ = aceita arb com lucro pequeno.
+#
+# arb_resolution             | preço | sempre 1.00
+#   Payout de resolução (1 share = $1.00 se ganha). Fixo.
+#
+# arb_min_shares             | shares | [0.05 .. 1.0]
+#   Nº mínimo de shares para executar arb.
+#   ↑ = ignora arbs muito pequenas.
+#   ↓ = aceita arbs pequenas.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# BAYESIAN + KALMAN + BINANCE (modelo de probabilidade)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# bayesian_prior             | probabilidade | [0.40 .. 0.60]
+#   Prior do modelo Bayesiano. 0.50 = sem bias.
+#
+# bayesian_likelihood_std    | desvio padrão | [0.003 .. 0.02]
+#   Largura da likelihood Gaussiana.
+#   ↑ = modelo reage mais lentamente a dados novos.
+#   ↓ = modelo reage mais rápido (mais volátil).
+#
+# bayesian_decay_rate        | fração/tick | [0.01 .. 0.10]
+#   Taxa de decay do posterior em direcção ao prior.
+#   ↑ = posterior reverte mais rápido ao prior (memória curta).
+#   ↓ = posterior mantém-se mais tempo (memória longa).
+#
+# binance_blend_weight       | fração | [0.30 .. 0.90]
+#   Peso do oráculo Binance no blend com posterior Bayesiano.
+#   ↑ = confia mais no preço Binance.
+#   ↓ = confia mais no modelo Bayesiano.
+#
+# kalman_process_noise       | variância | [1e-7 .. 1e-4]
+#   Ruído de processo do filtro Kalman.
+#   ↑ = Kalman segue dados mais de perto (mais reactivo).
+#   ↓ = Kalman mais suave (filtra mais ruído).
+#
+# kalman_measure_noise       | variância | [1e-4 .. 1e-2]
+#   Ruído de medida do filtro Kalman.
+#   ↑ = Kalman desconfia mais das medições.
+#   ↓ = Kalman confia mais nas medições.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# VOLATILIDADE + JUMP DIFFUSION
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# xrp_vol_annual_default     | vol anualizada | [0.50 .. 2.50]
+#   Volatilidade anualizada default do XRP.
+#   ↑ = modelo assume mais incerteza (probs mais perto de 50/50).
+#   ↓ = modelo assume mais certeza (probs mais extremas).
+#
+# jump_lambda                | rate/ano | [0.5 .. 3.0]
+#   Intensidade de jumps no modelo Jump Diffusion.
+#   ↑ = mais jumps esperados (tails mais pesadas).
+#   ↓ = menos jumps (mais GBM puro).
+#
+# jump_sigma                 | desvio padrão | [0.01 .. 0.05]
+#   Tamanho médio dos jumps.
+#   ↑ = jumps maiores.
+#   ↓ = jumps menores.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# SHADOW TRADING (simulação de fills em dry_run)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# shadow_latency_ms          | milissegundos | [20 .. 200]
+#   Latência simulada de rede + matching engine.
+#   ↑ = simulação mais pessimista (mais slippage).
+#   ↓ = simulação mais optimista.
+#
+# shadow_max_slippage_pct    | fração | [0.005 .. 0.05]
+#   Slippage máximo aceite em fills simulados.
+#   ↑ = aceita mais slippage (mais fills).
+#   ↓ = rejeita mais fills (mais realista).
+#
+# ═══════════════════════════════════════════════════════════════════════════
+###############################################################################
+
 @dataclass
 class BotConfig:
 
+    # ── CREDENTIALS & PATHS ──────────────────────────────────────────────
     dry_run: bool = True
     live_trading: bool = False
     polymarket_private_key: str = ""
@@ -128,81 +410,135 @@ class BotConfig:
     audit_file: str = "trade_audit.jsonl"
     secrets_path: str = "secrets.txt"
     bankroll_demo: Decimal = Decimal("100.0")
-    slippage_tolerance: float = 0.001
-    # v9.4.0 FEE_REAL: buffer applied to all edge calculations
-    fee_buffer: float = 0.006
-    gas_cost_usdc: float = 0.0
-    # v9.4.0 Shadow Trading: realistic fill simulation in dry_run
-    shadow_latency_ms: float = 80.0       # simulated network+matching latency
-    shadow_max_slippage_pct: float = 0.02  # max 2% slippage from best ask
-    mart_max_mult: int = 4
-    max_market_exposure: float = 0.28
-    kelly_max_risk_pct: float = 0.065
-    max_session_loss_pct: float = 1.0
-    max_consecutive_losses: int = 4
-    max_bankroll_exposure: float = 0.58
-    max_daily_loss_pct: float = 50.0
-    max_hourly_loss_pct: float = 20.0
-    hourly_pause_duration_s: float = 900.0
-    arb_resolution: float = 1.00
-    arb_min_shares: float = 0.10
-    arb_fee_base: float = 0.25
-    max_depth_impact_pct: float = 0.25
+
+    # ── FEES & SLIPPAGE ──────────────────────────────────────────────────
+    slippage_tolerance: float = 0.001       # fração, max slippage aceite
+    fee_buffer: float = 0.006               # fração, subtraído a todos os edges
+    gas_cost_usdc: float = 0.0              # USD, custo de gas (0 em Polygon)
+
+    # ── SHADOW TRADING ───────────────────────────────────────────────────
+    shadow_latency_ms: float = 40.0         # ms, latência simulada (v9.5.1: reduced from 80)
+    shadow_max_slippage_pct: float = 0.02   # fração, max 2% slippage
+
+    # ── SIZING & RISCO ───────────────────────────────────────────────────
+    kelly_max_risk_pct: float = 0.105        # fração, ~10.5% bankroll per trade (v9.5.2: was 0.095)
+    kelly_fraction: float = 0.48            # fração, fractional Kelly
+    kelly_assumed_edge: float = 0.040       # fração, edge para boost calc
+    kelly_mart_boost: float = 0.30          # fração, boost em Mart quando edge alto
+    max_market_exposure: float = 0.28       # fração, exposição máxima total
+    max_bankroll_exposure: float = 0.58     # fração, hard cap exposição
+    max_position_size_usd: float = 1000.0   # USD, hard cap por posição
+    max_active_trades: int = 8              # count, trades simultâneos max
+
+    # ── MARTINGALE ───────────────────────────────────────────────────────
+    mart_max_mult: int = 4                  # multiplicador, max Mart level
+    mart_recovery_factor: float = 1.22      # multiplicador, amplifica stake Mart
+    max_consecutive_losses: int = 5         # count, halt após N losses seguidos
+
+    # ── CIRCUIT BREAKERS ─────────────────────────────────────────────────
+    max_daily_loss_pct: float = 50.0        # %, halt se perda diária > X%
+    max_hourly_loss_pct: float = 25.0       # %, pausa se perda horária > X%
+    hourly_pause_duration_s: float = 900.0  # segundos, duração da pausa
+
+    # ── PEG ARB ──────────────────────────────────────────────────────────
+    peg_arb_active: bool = True             # liga/desliga PEG ARB
+    peg_trigger: float = 0.985              # preço, PEG max para trigger arb
+    peg_budget_pct: float = 0.03            # fração, % bankroll por arb
+    peg_cooldown_s: float = 5.0             # segundos, entre arbs
+    peg_min_profit_pct: float = 0.20        # %, lucro mínimo após fees
+    arb_resolution: float = 1.00            # preço, payout por share (fixo)
+    arb_min_shares: float = 0.10            # shares, mínimo para arb
+
+    # ── GAMBLING (estratégia principal) ──────────────────────────────────
     gambling_active: bool = True
-    gamb_start_rem_s: float = 300.0
-    gamb_cutoff_s: float = 25.0
-    gamb_buy_cooldown: float = 10.0
-    # v9.4.0: Gambling entry range: 50c-97c
-    gamb_min_ask_c: float = 50.0
-    gamb_max_ask_c: float = 97.0
-    min_prob_entry: float = 0.505
-    min_vwap_edge: float = 0.005
-    max_spread_cents: float = 1.45
-    bid_ask_min_ratio: float = 0.983
-    min_liquidity: float = 80.0
-    max_active_trades: int = 8
+    gamb_start_rem_s: float = 300.0         # segundos, início do gambling
+    gamb_cutoff_s: float = 25.0             # segundos, cutoff (para antes do fim)
+    gamb_buy_cooldown: float = 12.0         # segundos, cooldown entre compras (v9.5.3: was 6.0)
+    gamb_min_ask_c: float = 42.0            # cêntimos, ask mínimo (v9.5.2: was 45.0, more permissive)
+    gamb_max_ask_c: float = 93.0            # cêntimos, ask máximo (0.93)
+
+    # ── FILTROS DE ENTRADA (WR + frequência) ─────────────────────────────
+    # v9.4.5: relaxed para desbloquear entradas (v9.4.4 bloqueava 100%)
+    min_prob_entry: float = 0.52             # probabilidade, P(side) mínima (era 0.545)
+    min_vwap_edge: float = 0.020            # fração, edge mínimo após VWAP+fees (era 0.042)
+    max_spread_cents: float = 3.0           # cêntimos, spread max aceite (era 2.2)
+    bid_ask_min_ratio: float = 0.955        # ratio, bid/ask mínimo (era 0.975)
+
+    # ── ENDGAME ──────────────────────────────────────────────────────────
     aggressive_endgame_active: bool = True
-    endgame_trigger_s: float = 45.0
-    aggressive_endgame_s: float = 25.0
-    aggressive_endgame_risk: float = 0.08
-    aggressive_endgame_min_c: float = 0.70
-    aggressive_endgame_max_c: float = 0.98
-    endgame_high_z_risk: float = 0.10
-    endgame_high_z_thresh: float = 2.5
-    rollback_limit_premium: float = 0.02
+    aggressive_endgame_s: float = 25.0      # segundos, janela endgame
+    aggressive_endgame_risk: float = 0.18   # fração, risk % endgame base (relaxed)
+    aggressive_endgame_min_c: float = 0.48  # preço, ask mínimo endgame (relaxed)
+    aggressive_endgame_max_c: float = 0.995 # preço, ask máximo endgame (relaxed)
+    endgame_high_z_risk: float = 0.24       # fração, risk % em Z alto (relaxed)
+    endgame_high_z_thresh: float = 2.5      # z-score, limiar para high risk
+
+    # ── TAKE PROFIT (v9.5.3: Moonbag TP -- sell minimum to recover 100% capital)
     partial_tp_active: bool = True
-    partial_tp_fraction: float = 1.0
-    bayesian_prior: float = 0.50
-    bayesian_likelihood_std: float = 0.008
-    bayesian_decay_rate: float = 0.030
-    bayesian_min_ticks: int = 5
-    vol_edge_window: int = 10
-    vol_edge_sigma_floor: float = 0.004
-    es_min_threshold: float = 2.55
-    kelly_assumed_edge: float = 0.040
-    kelly_fraction: float = 0.48
-    vol_kelly_target: float = 0.025
-    kelly_assumed_edge_val: float = 0.040
-    hft_window_seconds: float = 4.0
-    kalman_process_noise: float = 5e-6
-    kalman_measure_noise: float = 2.5e-3
-    rate_limit_calls: float = 12.0
-    rate_limit_burst: float = 25.0
-    max_api_retries: int = 5
-    base_backoff_s: float = 0.8
-    max_backoff_s: float = 20.0
+    partial_tp_fraction: float = 0.80       # fração, CEILING: max % that can be sold (moonbag sells less)
+    partial_tp_target_net_roi: float = 0.08 # fração, minimum bid gain to trigger TP check
+
+    # ── HEDGE DINÂMICO (flip contra direção errada) ──────────────────────
+    # v9.5.2: Balanced flip — not too hair-trigger, limits hedge size.
+    # NEVER fires on VOL_HEDGE or ENDGAME trades.
+    adverse_stop_cents: float = 0.9          # cêntimos, 0.9c trigger (v9.5.2: was 0.3)
+    hedge_max_risk_pct: float = 0.07         # fração, risk % do hedge buy oposto (was 0.08)
+    hedge_min_prob_opposite: float = 0.65    # probabilidade, P(oposto) mínima
+    hedge_flip_speed_thresh: float = 0.002   # fração, BNC price velocity (%/s) for instant flip
+    hedge_flip_imbalance_thresh: float = 0.25  # ratio, OBI < this confirms adverse move
+    hedge_flip_confirms_needed: int = 3      # count, min confirmations (v9.5.2: was 2)
+
+    # ── STOP-LOSS POR TRADE (v9.5.2) ─────────────────────────────────────
+    max_loss_per_trade_pct: float = 0.40     # fração, -40% max loss per GAMBLING trade (v9.5.3: was 0.15)
+
+    # ── VOL HEDGE 1SD-3SD (v9.4.6 -- estratégia principal) ───────────
+    vol_hedge_active: bool = True            # liga/desliga vol hedge 1SD-3SD
+    vol_hedge_sd_window: int = 30            # ticks Binance para cálculo do SD
+    vol_hedge_1sd_trigger: float = 1.0       # multiplicador SD para trigger entrada
+    vol_hedge_3sd_target: float = 3.0        # multiplicador SD para hedge fill target
+    vol_hedge_no_limit_low: float = 0.10     # preço mínimo limite NO (10c)
+    vol_hedge_no_limit_high: float = 0.15    # preço máximo limite NO (15c)
+    vol_hedge_abandon_s: float = 60.0        # segundos antes do fecho para abandonar hedge
+    vol_hedge_cooldown_s: float = 8.0        # cooldown entre entradas vol_hedge
+    vol_hedge_max_risk_pct: float = 0.10     # risk % para posição vol_hedge
+    vol_hedge_min_sd: float = 0.00005        # SD mínimo para evitar triggers em flat market
+    vol_hedge_liquidity_min: float = 5.0     # volume mínimo no book para limit order NO
+
+    # ── BAYESIAN + KALMAN ────────────────────────────────────────────────
+    bayesian_prior: float = 0.50            # probabilidade, prior P(UP)
+    bayesian_likelihood_std: float = 0.008  # desvio padrão, largura likelihood
+    bayesian_decay_rate: float = 0.030      # fração/tick, decay ao prior
+
+    # ── EDGE SCORING ─────────────────────────────────────────────────────
+    vol_edge_window: int = 10               # ticks, janela do edge tracker
+    vol_edge_sigma_floor: float = 0.004     # fração, sigma mínimo
+    es_min_threshold: float = 1.60          # z-score, edge score mínimo (v9.5.2: was 1.80)
+    vol_kelly_target: float = 0.025         # fração, kelly target vol scaling
+
+    # ── HFT / KALMAN ────────────────────────────────────────────────────
+    hft_window_seconds: float = 4.0         # segundos, janela HFT z-score
+    kalman_process_noise: float = 5e-6      # variância, processo Kalman
+    kalman_measure_noise: float = 2.5e-3    # variância, medida Kalman
+
+    # ── API / RATE LIMITING / CIRCUIT BREAKER ────────────────────────────
+    rate_limit_calls: float = 12.0          # calls/s
+    rate_limit_burst: float = 25.0          # calls, burst max
+    max_api_retries: int = 5                # count
+    base_backoff_s: float = 0.8             # segundos
+    max_backoff_s: float = 20.0             # segundos
     backoff_jitter: bool = True
-    cb_fail_threshold: int = 5
-    cb_recovery_s: float = 45.0
+    cb_fail_threshold: int = 5              # count, falhas para abrir CB
+    cb_recovery_s: float = 45.0             # segundos, tempo de recovery CB
     redeem_cb_threshold: int = 5
-    redeem_cb_recovery: float = 120.0
+    redeem_cb_recovery: float = 120.0       # segundos
+
+    # ── WEBSOCKET ────────────────────────────────────────────────────────
     ws_reconnect_base_s: float = 0.8
     ws_reconnect_max_s: float = 15.0
-    ws_heartbeat_interval: int = 4
-    ws_heartbeat_timeout: int = 8
-    rollback_timeout_s: float = 3.0
-    rollback_extra_slip: float = 0.04
-    rollback_max_retries: int = 3
+    ws_heartbeat_interval: int = 4          # segundos
+    ws_heartbeat_timeout: int = 8           # segundos
+
+    # ── ENDPOINTS ────────────────────────────────────────────────────────
     clob_rest_url: str = "https://clob.polymarket.com"
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     ws_uri: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -212,48 +548,54 @@ class BotConfig:
     binance_reconnect_base_s: float = 0.8
     binance_reconnect_max_s: float = 20.0
     binance_ping_interval_s: float = 15.0
-    xrp_vol_annual_default: float = 1.10
-    xrp_vol_window_ticks: int = 15
-    xrp_drift_ema_alpha: float = 0.18
-    stale_data_threshold_s: float = 2.5
-    time_decay_floor_s: float = 1.5
-    sigmoid_steepness: float = 15.0
-    sigma_floor: float = 0.04
-    prob_min: float = 0.02
-    prob_max: float = 0.98
-    jump_lambda: float = 1.2
-    jump_mu: float = 0.0
-    jump_sigma: float = 0.025
-    jump_terms: int = 4
+
+    # ── BINANCE ORACLE / VOL ─────────────────────────────────────────────
+    xrp_vol_annual_default: float = 1.10    # vol anualizada
+    xrp_vol_window_ticks: int = 15          # ticks
+    xrp_drift_ema_alpha: float = 0.18       # fração, EMA alpha
+    stale_data_threshold_s: float = 2.5     # segundos
+    time_decay_floor_s: float = 1.5         # segundos
+    sigmoid_steepness: float = 15.0         # adimensional
+    sigma_floor: float = 0.04               # fração
+    prob_min: float = 0.02                  # probabilidade
+    prob_max: float = 0.98                  # probabilidade
+
+    # ── JUMP DIFFUSION ───────────────────────────────────────────────────
+    jump_lambda: float = 1.2                # rate/ano, intensidade jumps
+    jump_mu: float = 0.0                    # fração, média dos jumps
+    jump_sigma: float = 0.025               # fração, desvio dos jumps
+    jump_terms: int = 4                     # count, termos na série
+
+    # ── FUNDING RATE ─────────────────────────────────────────────────────
     funding_rate_url: str = "https://fapi.binance.com/fapi/v1/fundingRate"
     funding_rate_symbol: str = "XRPUSDT"
-    funding_rate_poll_s: float = 25.0
-    funding_rate_bull_thresh: float = 0.0004
-    funding_rate_bear_thresh: float = -0.0004
-    binance_blend_weight: float = 0.72
-    default_taker_fee_bps: int = 50
+    funding_rate_poll_s: float = 25.0       # segundos
+    funding_rate_bull_thresh: float = 0.0004  # fração
+    funding_rate_bear_thresh: float = -0.0004 # fração
+    binance_blend_weight: float = 0.72      # fração, peso Binance no blend
+
+    # ── ADAPTIVE EDGE ────────────────────────────────────────────────────
+    default_taker_fee_bps: int = 50         # bps
     adaptive_edge_winrate_high: float = 0.65
     adaptive_edge_winrate_low: float = 0.50
     adaptive_edge_scale_win: float = 0.85
     adaptive_edge_scale_loss: float = 1.25
     adaptive_edge_min: float = 0.002
     adaptive_edge_max: float = 0.06
-    max_position_size_usd: float = 14.5
-    settlement_timeout_s: float = 180.0
-    settlement_backoff_base_s: float = 3.0
-    reconcile_interval_s: float = 20.0
+
+    # ── SETTLEMENT / RECONCILIATION ──────────────────────────────────────
+    settlement_timeout_s: float = 180.0     # segundos
+    settlement_backoff_base_s: float = 3.0  # segundos
+    reconcile_interval_s: float = 20.0      # segundos
     slack_webhook_url: str = ""
-    pagerduty_key: str = ""
+
+    # ── VOL REGIME (logging only) ────────────────────────────────────────
     ewma_vol_alpha: float = 0.08
     ewma_vol_min_ticks: int = 4
-    # v9.4.0: vol regime detection (logging only -- no behavior change)
     vol_regime_low_thresh: float = 0.40
     vol_regime_high_thresh: float = 1.20
     vol_short_weight: float = 0.65
     vol_hysteresis_s: float = 45.0
-    # v9.4.0 martingale optimization
-    mart_recovery_factor: float = 1.15
-    kelly_mart_boost: float = 0.30
 
     def validate(self) -> None:
         if self.live_trading and not self.polymarket_private_key:
@@ -266,6 +608,8 @@ class BotConfig:
             raise ValueError("min_prob_entry must be >= 0.50 (50%)")
         if self.kelly_fraction > 0.50:
             raise ValueError("kelly_fraction must be <= 0.50 (50%)")
+        if self.peg_trigger > 1.0:
+            raise ValueError("peg_trigger must be <= 1.0")
 
     @classmethod
     def from_env_and_secrets(cls, secrets_path: str = "secrets.txt") -> "BotConfig":
@@ -291,8 +635,6 @@ class BotConfig:
             cfg.live_trading = True
         if webhook := _get("SLACK_WEBHOOK_URL"):
             cfg.slack_webhook_url = webhook
-        if pd_key := _get("PAGERDUTY_KEY"):
-            cfg.pagerduty_key = pd_key
         cfg.validate()
         return cfg
 
@@ -463,9 +805,17 @@ def fmt_pct(v: float) -> str:
     else:
         return f"{v:.2f}%"
 
+def fmt_pnl(pnl: Union[Decimal, float], pnl_pct: float) -> str:
+    """v9.5.0: Exact PnL format: 'PnL: (+)$X.XXXXXX (+Y.YY%)' or 'PnL: (-)$X.XXXXXX (-Y.YY%)'."""
+    fv = _safe_float(pnl)
+    if fv >= 0:
+        return f"PnL: (+)${fv:.6f} (+{abs(pnl_pct):.2f}%)"
+    else:
+        return f"PnL: (-)${abs(fv):.6f} (-{abs(pnl_pct):.2f}%)"
+
 def log_info(msg: str) -> None:
     # Per spec: non-module-specific logs use [DEBUG] fallback format.
-    # Module-specific logs use their own helpers (log_gambling, log_peg, etc.)
+    # Module-specific logs use their own helpers (log_gambling, log_endgame, etc.)
     _get_logger().debug("[DEBUG] [%s] | %s", _ts(), msg)
 
 def log_warn(msg: str) -> None:
@@ -486,14 +836,8 @@ def log_sep2() -> None:
 
 # ── Module-specific helpers (exact spec format) ───────────────────────────────
 # Format: [INFO] [MODULE] [DD/MM/YY | HH:MM:SS.ms] | message
-def log_synth_peg(msg: str) -> None:
-    _get_logger().info("[INFO] [SYNTH_PEG] [%s] | %s", _ts(), msg)
-
 def log_endgame(msg: str) -> None:
     _get_logger().info("[INFO] [ENDGAME] [%s] | %s", _ts(), msg)
-
-def log_endgame_agg(msg: str) -> None:
-    _get_logger().info("[INFO] [ENDGAME_AGG] [%s] | %s", _ts(), msg)
 
 def log_gambling(msg: str) -> None:
     _get_logger().info("[INFO] [GAMBLING] [%s] | %s", _ts(), msg)
@@ -504,6 +848,9 @@ def log_peg(msg: str) -> None:
 def log_binance(msg: str) -> None:
     _get_logger().info("[INFO] [BINANCE] [%s] | %s", _ts(), msg)
 
+def log_vol_hedge(msg: str) -> None:
+    _get_logger().info("[INFO] [VOL_HEDGE] [%s] | %s", _ts(), msg)
+
 def log_m(module: str, action: str, msg: str) -> None:
     """Route to correct module helper; action is merged into message body.
 
@@ -511,14 +858,13 @@ def log_m(module: str, action: str, msg: str) -> None:
     No extra bracket for action per spec.
     """
     _prefix_map: Dict[str, str] = {
-        "GAMBLING":      "[INFO] [GAMBLING]",
-        "ENDGAME_AGG":   "[INFO] [ENDGAME_AGG]",
-        "ENDGAME":       "[INFO] [ENDGAME]",
-        "SYNTH_PEG":     "[INFO] [SYNTH_PEG]",
-        "SYNTHETIC_PEG": "[INFO] [SYNTH_PEG]",
-        "PEG ARBIT":     "[INFO] [PEG]",
-        "PEG_ARBIT":     "[INFO] [PEG]",
-        "BINANCE":       "[INFO] [BINANCE]",
+        "GAMBLING":        "[INFO] [GAMBLING]",
+        "ENDGAME_AGG":     "[INFO] [ENDGAME_AGG]",
+        "ENDGAME":         "[INFO] [ENDGAME]",
+        "PEG_ARBIT":       "[INFO] [PEG]",
+        "BINANCE":         "[INFO] [BINANCE]",
+        "VOL_HEDGE_YES":   "[INFO] [VOL_HEDGE]",
+        "VOL_HEDGE_NO":    "[INFO] [VOL_HEDGE]",
     }
     prefix = _prefix_map.get(module, f"[DEBUG]")
     # action folded into message body — no extra bracket
@@ -930,6 +1276,194 @@ class ShadowFillEngine:
             latency_ms=actual_lat_ms,
         )
 
+    async def try_fill_sell(
+        self,
+        side: str,
+        shares: float,
+        initial_bid: float,
+        ctx: "BotContext",
+    ) -> ShadowFillResult:
+        """v9.5.0: Simulate a SELL order against the live L2 BID book.
+
+        Mirrors try_fill() logic exactly but walks bids (descending) instead of asks.
+        """
+        side_key = side.lower()
+
+        # ── Step 1: verify pre-latency book is alive ─────────────────────────
+        l2_pre = ctx.l2_up if side_key == "up" else ctx.l2_down
+        if l2_pre.is_stale(3.0) or not l2_pre.bids:
+            self._reject_count += 1
+            return ShadowFillResult(
+                reject_reason=f"STALE_BOOK_SELL_{side} (pre-latency)"
+            )
+
+        # ── Step 2: simulate network + matching engine latency ───────────────
+        _lat_start = time.time()
+        jitter = random.uniform(0.6, 1.0)
+        await asyncio.sleep(self._latency_s * jitter)
+        actual_lat_ms = (time.time() - _lat_start) * 1000.0
+
+        # ── Step 3: re-read live L2 AFTER latency ────────────────────────────
+        l2_post = ctx.l2_up if side_key == "up" else ctx.l2_down
+        if l2_post.is_stale(3.0) or not l2_post.bids:
+            self._reject_count += 1
+            return ShadowFillResult(
+                latency_ms=actual_lat_ms,
+                reject_reason=f"STALE_BOOK_SELL_{side} (post-latency)",
+            )
+
+        # ── Step 4: walk post-latency bids (descending) to compute VWAP ─────
+        total_proceeds = 0.0
+        filled = 0.0
+        for price, size in sorted(l2_post.bids, key=lambda x: -x[0]):
+            if filled >= shares:
+                break
+            take = min(size, shares - filled)
+            total_proceeds += take * price
+            filled += take
+
+        if filled < shares * 0.95:
+            self._reject_count += 1
+            return ShadowFillResult(
+                latency_ms=actual_lat_ms,
+                reject_reason=(
+                    f"INSUFFICIENT_BID_DEPTH_{side} "
+                    f"need={shares:.4f} have={filled:.4f}"
+                ),
+            )
+
+        vwap = total_proceeds / filled if filled > 1e-9 else initial_bid
+
+        # ── Step 5: slippage check (max 2% adverse from initial bid) ─────────
+        slippage = (initial_bid - vwap) / initial_bid if initial_bid > 1e-9 else 0.0
+        if slippage > self._max_slip:
+            self._reject_count += 1
+            return ShadowFillResult(
+                fill_price=vwap,
+                shares_filled=filled,
+                slippage_pct=slippage,
+                latency_ms=actual_lat_ms,
+                reject_reason=(
+                    f"SELL_SLIPPAGE_{side} "
+                    f"vwap={vwap:.4f} vs bid={initial_bid:.4f} "
+                    f"slip={slippage:.4%} > max={self._max_slip:.1%}"
+                ),
+            )
+
+        # ── Step 6: FILL at VWAP ─────────────────────────────────────────────
+        self._fill_count += 1
+        return ShadowFillResult(
+            filled=True,
+            fill_price=vwap,
+            shares_filled=filled,
+            slippage_pct=slippage,
+            latency_ms=actual_lat_ms,
+        )
+
+    async def try_fill_limit_no(
+        self,
+        side: str,
+        shares: float,
+        limit_price: float,
+        ctx: "BotContext",
+        max_total_cost_pct: float = 0.93,
+        yes_total_out: float = 0.0,
+    ) -> ShadowFillResult:
+        """v9.5.0: Two-phase verification for NO hedge limit order fill.
+
+        Phase 1: Check effective liquidity within ±2% of limit_price.
+                 Compute total cost with slippage + fees.
+        Wait 50ms.
+        Phase 2: Repeat check. Only fill if BOTH pass AND
+                 (yes_total_out + no_cost + fees) / shares <= max_total_cost_pct.
+
+        Args:
+            side: "UP" or "DOWN" (the NO side being bought)
+            shares: exact number of shares (= YES trade shares)
+            limit_price: dynamic max_hedge_price
+            ctx: BotContext
+            max_total_cost_pct: maximum total cost per share (YES+NO+fees) ≤ 0.93
+            yes_total_out: total cost of the YES leg
+        """
+        side_key = side.lower()
+        slip_pct = 0.02  # ±2% slippage tolerance
+        max_price_with_slip = limit_price * (1.0 + slip_pct)
+
+        async def _verify_phase(phase_label: str) -> Tuple[bool, float, float, float, str]:
+            """Returns (ok, eff_vwap, eff_cost, eff_filled, reason)."""
+            l2 = ctx.l2_up if side_key == "up" else ctx.l2_down
+            if l2.is_stale(3.0) or not l2.asks:
+                return False, 0.0, 0.0, 0.0, f"STALE_BOOK_{phase_label}"
+
+            # Walk asks within ±2% of limit_price (up to 15+ levels)
+            eff_cost = 0.0
+            eff_filled = 0.0
+            asks_sorted = sorted(l2.asks, key=lambda x: x[0])
+            for price, size in asks_sorted[:max(15, len(asks_sorted))]:
+                if price > max_price_with_slip:
+                    break
+                if eff_filled >= shares:
+                    break
+                take = min(size, shares - eff_filled)
+                eff_cost += take * price
+                eff_filled += take
+
+            if eff_filled < shares:
+                return (False, 0.0, eff_cost, eff_filled,
+                        f"INSUFFICIENT_LIQ_{phase_label} "
+                        f"need={shares:.4f} have={eff_filled:.4f}")
+
+            eff_vwap = eff_cost / eff_filled if eff_filled > 1e-9 else limit_price
+
+            # Add Polymarket fee on the NO leg
+            fee_no = polymarket_fee(eff_filled, eff_vwap)
+            total_no_cost = eff_cost + fee_no
+
+            # Check total cost constraint: (YES_out + NO_cost) / shares <= 0.93
+            if shares > 1e-9 and yes_total_out > 0.0:
+                cost_per_share = (yes_total_out + total_no_cost) / shares
+                if cost_per_share > max_total_cost_pct:
+                    return (False, eff_vwap, total_no_cost, eff_filled,
+                            f"TOTAL_COST_EXCEEDED_{phase_label} "
+                            f"cost/share={cost_per_share:.4f} > "
+                            f"max={max_total_cost_pct:.2f}")
+
+            return True, eff_vwap, total_no_cost, eff_filled, ""
+
+        # ── Phase 1 ──────────────────────────────────────────────────────────
+        ok1, vwap1, cost1, filled1, reason1 = await _verify_phase("P1")
+        if not ok1:
+            self._reject_count += 1
+            return ShadowFillResult(
+                reject_reason=f"VOL_HEDGE_NO_REJECT_P1 | {reason1}"
+            )
+
+        # ── Wait 50ms ────────────────────────────────────────────────────────
+        await asyncio.sleep(0.050)
+
+        # ── Phase 2 ──────────────────────────────────────────────────────────
+        ok2, vwap2, cost2, filled2, reason2 = await _verify_phase("P2")
+        if not ok2:
+            self._reject_count += 1
+            return ShadowFillResult(
+                fill_price=vwap1,
+                shares_filled=filled1,
+                latency_ms=50.0,
+                reject_reason=f"VOL_HEDGE_NO_REJECT_P2 | {reason2}"
+            )
+
+        # ── Both phases passed → FILL at worst VWAP of the two ──────────────
+        final_vwap = max(vwap1, vwap2)  # worst case
+        slippage = (final_vwap - limit_price) / limit_price if limit_price > 1e-9 else 0.0
+        self._fill_count += 1
+        return ShadowFillResult(
+            filled=True,
+            fill_price=final_vwap,
+            shares_filled=min(filled1, filled2),
+            slippage_pct=slippage,
+            latency_ms=50.0,
+        )
+
     @property
     def stats(self) -> str:
         total = self._fill_count + self._reject_count
@@ -990,6 +1524,8 @@ class BotContext:
     _final_log_done: bool = False
     # v9.4.0: Shadow Fill Engine for realistic dry_run simulation
     shadow_engine: Optional[ShadowFillEngine] = None
+    # v9.5.0: Volatility Hedge Engine 1SD-3SD
+    vol_hedge_engine: Optional["VolatilityHedgeEngine"] = None
     # v9.4.0: accumulated realized PnL for current cycle
     round_realized_pnl: Decimal = field(default_factory=lambda: _ZERO)
 
@@ -1192,7 +1728,7 @@ class TradeStateManager:
         self, base_stake: Decimal, ask: float, token_id: str,
         fee_fn: Callable[[str], float], bankroll: Decimal,
         edge: float = 0.0, kelly_assumed_edge: float = 0.040,
-        mart_recovery_factor: float = 1.15, kelly_mart_boost: float = 0.30,
+        mart_recovery_factor: float = 1.22, kelly_mart_boost: float = 0.30,
     ) -> Decimal:
         # v9.4.0: apply mart_recovery_factor to amplify recovery staking
         raw_stake = base_stake * _d(self.state.mart_level) * _d(mart_recovery_factor)
@@ -1406,6 +1942,26 @@ class BinanceState:
         mean = sum(vals) / n
         var = sum((r - mean) ** 2 for r in vals) / max(n - 1, 1)
         return max(math.sqrt(var) * math.sqrt(_SECS_PER_YEAR), 0.01)
+
+    def recent_trend(self, lookback_s: float = 600.0) -> str:
+        """Return 'FALLING', 'RISING' or 'FLAT' based on 10min price history."""
+        if len(self._price_history_10s) < 2:
+            return "FLAT"
+        now = time.time()
+        cutoff = now - lookback_s
+        pts = [(ts, p) for ts, p in self._price_history_10s if ts >= cutoff]
+        if len(pts) < 2:
+            return "FLAT"
+        first_p = pts[0][1]
+        last_p = pts[-1][1]
+        if first_p <= 0:
+            return "FLAT"
+        pct = (last_p - first_p) / first_p * 100.0
+        if pct < -0.01:
+            return "FALLING"
+        elif pct > 0.01:
+            return "RISING"
+        return "FLAT"
 
     def get_vol_regime(self, cfg: BotConfig) -> "VolRegime":
         """Compute volatility regime from blended short/long vol.
@@ -1915,6 +2471,315 @@ class VolatilityEdgeTracker:
         return f"σ_mkt={self.sigma_mkt:.4f} ticks={self.tick_count}"
 
 ###############################################################################
+# SECTION 15b -- VOLATILITY HEDGE ENGINE 1SD-3SD (v9.5.0)
+###############################################################################
+class VolHedgeState(Enum):
+    """State machine for a single vol-hedge position."""
+    IDLE = "IDLE"                       # waiting for 1SD cross
+    YES_OPEN = "YES_OPEN"               # SIM bought, NO limit pending
+    HEDGE_FILLED = "HEDGE_FILLED"       # NO limit filled → profit locked
+    ABANDONED = "ABANDONED"             # < 60s to close, let resolve
+
+@dataclass
+class VolHedgePosition:
+    """Tracks a single volatility hedge position (1SD entry + 3SD hedge)."""
+    direction: str                     # "UP" or "DOWN"
+    entry_price_bnc: float             # Binance price at 1SD trigger
+    k_reference: float                 # cycle open price (k)
+    sd_at_entry: float                 # SD at time of entry
+    yes_trade: Optional[Trade] = None  # the YES trade (SIM side)
+    no_limit_price: float = 0.0        # limit price for NO hedge (0.10-0.15)
+    no_limit_placed: bool = False       # whether limit order was placed
+    no_limit_filled: bool = False       # whether limit was filled (3SD reached)
+    no_trade: Optional[Trade] = None   # the NO trade if filled
+    state: VolHedgeState = VolHedgeState.IDLE
+    created_ts: float = field(default_factory=time.time)
+    abandoned: bool = False
+
+
+class VolatilityHedgeEngine:
+    """Implements the 1SD-3SD Volatility Hedge strategy for XRP 5-min candles.
+
+    Strategy:
+        k = cycle_open_price (baseline / moving average)
+        SD = real-time standard deviation from Binance tick returns
+
+        UP Rules:
+          1. Price crosses k + 1*SD  → BUY YES(UP) at current ask
+          2. Immediately place limit order to BUY NO(DOWN) at 0.10-0.15c
+          3. Price reaches k + 3*SD  → NO limit fills → profit locked (YES+NO < $1)
+
+        DOWN Rules (symmetric):
+          1. Price crosses k - 1*SD  → BUY YES(DOWN)
+          2. Place limit BUY NO(UP) at 0.10-0.15c
+          3. Price reaches k - 3*SD  → NO fills → locked
+
+        Risk Management:
+          - If < 60s to candle close and 3SD not hit → abandon hedge,
+            let YES position resolve at close ($1 or $0).
+          - Verify liquidity on NO side before placing limit.
+    """
+
+    def __init__(self, cfg: BotConfig) -> None:
+        self._cfg = cfg
+        self._positions: List[VolHedgePosition] = []
+        self._last_trigger_ts: float = 0.0
+        self._price_buffer: deque = deque(maxlen=cfg.vol_hedge_sd_window)
+        self._1sd_crossed_up: bool = False
+        self._1sd_crossed_down: bool = False
+        self._stats_entries: int = 0
+        self._stats_hedged: int = 0
+        self._stats_abandoned: int = 0
+        self._stats_resolved: int = 0
+
+    def feed_price(self, price: float) -> None:
+        """Feed a new Binance tick price for SD calculation."""
+        self._price_buffer.append(price)
+
+    @property
+    def current_sd(self) -> float:
+        """Compute real-time standard deviation from buffered prices."""
+        n = len(self._price_buffer)
+        if n < 5:
+            return 0.0
+        prices = list(self._price_buffer)
+        # Compute log returns for SD calculation
+        returns = []
+        for i in range(1, n):
+            if prices[i - 1] > 1e-9:
+                returns.append(math.log(prices[i] / prices[i - 1]))
+        if len(returns) < 3:
+            return 0.0
+        mean_r = sum(returns) / len(returns)
+        var = sum((r - mean_r) ** 2 for r in returns) / max(len(returns) - 1, 1)
+        sd = math.sqrt(max(var, 0.0))
+        return sd
+
+    @property
+    def current_sd_price(self) -> float:
+        """SD expressed in price terms (SD * current_mean_price)."""
+        n = len(self._price_buffer)
+        if n < 5:
+            return 0.0
+        prices = list(self._price_buffer)
+        mean_price = sum(prices) / n
+        sd = self.current_sd
+        return sd * mean_price
+
+    def has_active_position(self, direction: str) -> bool:
+        """Check if there's already an active vol-hedge position for this direction."""
+        return any(
+            p.direction == direction and p.state in (
+                VolHedgeState.YES_OPEN, VolHedgeState.HEDGE_FILLED
+            )
+            for p in self._positions
+        )
+
+    def check_1sd_trigger(
+        self, binance: "BinanceState", cfg: BotConfig,
+    ) -> Optional[str]:
+        """Check if Binance price has crossed k ± 1*SD.
+
+        Returns:
+            "UP" if price crossed k + 1*SD (bullish breakout)
+            "DOWN" if price crossed k - 1*SD (bearish breakout)
+            None if no trigger
+        """
+        if not cfg.vol_hedge_active:
+            return None
+        if binance.current_price is None or binance.cycle_open_price is None:
+            return None
+
+        k = binance.cycle_open_price
+        price = binance.current_price
+        sd = self.current_sd_price
+
+        if sd < cfg.vol_hedge_min_sd:
+            return None
+
+        threshold_up = k + cfg.vol_hedge_1sd_trigger * sd
+        threshold_down = k - cfg.vol_hedge_1sd_trigger * sd
+
+        now = time.time()
+        if now - self._last_trigger_ts < cfg.vol_hedge_cooldown_s:
+            return None
+
+        if price >= threshold_up and not self.has_active_position("UP"):
+            self._1sd_crossed_up = True
+            return "UP"
+        elif price <= threshold_down and not self.has_active_position("DOWN"):
+            self._1sd_crossed_down = True
+            return "DOWN"
+
+        return None
+
+    def check_3sd_reached(
+        self, binance: "BinanceState", cfg: BotConfig,
+    ) -> List[VolHedgePosition]:
+        """Check if any active position has reached the 3SD target.
+
+        Returns list of positions where 3SD was reached (NO hedge should fill).
+        """
+        if binance.current_price is None or binance.cycle_open_price is None:
+            return []
+
+        k = binance.cycle_open_price
+        price = binance.current_price
+        sd = self.current_sd_price
+        reached = []
+
+        for pos in self._positions:
+            if pos.state != VolHedgeState.YES_OPEN:
+                continue
+            # Use SD at entry time for consistency
+            sd_entry = pos.sd_at_entry if pos.sd_at_entry > 1e-9 else sd
+            target_3sd = cfg.vol_hedge_3sd_target * sd_entry
+
+            if pos.direction == "UP":
+                target_price = pos.k_reference + target_3sd
+                if price >= target_price:
+                    reached.append(pos)
+            else:  # DOWN
+                target_price = pos.k_reference - target_3sd
+                if price <= target_price:
+                    reached.append(pos)
+
+        return reached
+
+    def check_abandon(
+        self, timer: "MarketTimer", cfg: BotConfig,
+    ) -> List[VolHedgePosition]:
+        """Check positions that should be abandoned (< abandon_s to close, 3SD not hit).
+
+        Returns list of positions to abandon.
+        """
+        to_abandon = []
+        rem = timer.remaining
+
+        for pos in self._positions:
+            if pos.state != VolHedgeState.YES_OPEN:
+                continue
+            if rem <= cfg.vol_hedge_abandon_s:
+                to_abandon.append(pos)
+
+        return to_abandon
+
+    def compute_no_limit_price(
+        self, cfg: BotConfig, yes_trade: Optional[Trade] = None,
+    ) -> float:
+        """v9.5.0: Dynamic max_hedge_price = 0.90 - (custo_total_YES / N_shares).
+
+        Never uses fixed 0.12. Price rounded to 4 decimal places.
+        Falls back to midpoint of [no_limit_low, no_limit_high] only if
+        yes_trade is None (pre-entry estimate).
+        """
+        if yes_trade is not None and yes_trade.shares > _d("1e-9"):
+            n_shares = float(yes_trade.shares)
+            cost_per_share = float(yes_trade.total_out) / n_shares
+            dynamic_price = round(0.90 - cost_per_share, 4)
+            # Clamp to sane range: never below 0.01 or above 0.20
+            dynamic_price = max(0.01, min(0.20, dynamic_price))
+            return dynamic_price
+        # Fallback for pre-entry estimate
+        return round(
+            (cfg.vol_hedge_no_limit_low + cfg.vol_hedge_no_limit_high) / 2.0,
+            4,
+        )
+
+    def check_no_side_liquidity(
+        self, direction: str, ctx: "BotContext", cfg: BotConfig,
+        limit_price: Optional[float] = None,
+    ) -> Tuple[bool, float]:
+        """v9.5.0: Verify effective liquidity on NO side within ±2% slippage.
+
+        Walks up to 15+ levels of the ask book on the opposite side.
+        Only counts volume at prices within limit_price * (1 + 0.02).
+
+        Returns (has_liquidity, available_volume).
+        """
+        # NO side is the OPPOSITE direction
+        if direction == "UP":
+            l2 = ctx.l2_down
+        else:
+            l2 = ctx.l2_up
+
+        if l2.is_stale(3.0) or not l2.asks:
+            return False, 0.0
+
+        # Use provided limit_price or fallback estimate
+        lp = limit_price if limit_price is not None else self.compute_no_limit_price(cfg)
+        max_price = lp * 1.02  # +2% slippage tolerance
+
+        available = 0.0
+        asks_sorted = sorted(l2.asks, key=lambda x: x[0])
+        for price, size in asks_sorted[:max(15, len(asks_sorted))]:
+            if price <= max_price:
+                available += size
+
+        return available >= cfg.vol_hedge_liquidity_min, available
+
+    def register_entry(
+        self, direction: str, trade: Trade,
+        k: float, sd: float, no_limit_price: float,
+    ) -> VolHedgePosition:
+        """v9.5.0: Register a new 1SD entry with dynamic NO limit price.
+
+        The no_limit_price is computed dynamically as:
+            max_hedge_price = 0.90 - (trade.total_out / trade.shares)
+        This is computed by the caller via compute_no_limit_price(cfg, trade).
+        """
+        pos = VolHedgePosition(
+            direction=direction,
+            entry_price_bnc=trade.ask,
+            k_reference=k,
+            sd_at_entry=sd,
+            yes_trade=trade,
+            no_limit_price=no_limit_price,
+            state=VolHedgeState.YES_OPEN,
+        )
+        self._positions.append(pos)
+        self._last_trigger_ts = time.time()
+        self._stats_entries += 1
+        return pos
+
+    def mark_hedge_filled(self, pos: VolHedgePosition, no_trade: Trade) -> None:
+        """Mark a position as fully hedged (NO limit filled at 3SD)."""
+        pos.no_trade = no_trade
+        pos.no_limit_filled = True
+        pos.state = VolHedgeState.HEDGE_FILLED
+        self._stats_hedged += 1
+
+    def mark_abandoned(self, pos: VolHedgePosition) -> None:
+        """Mark a position as abandoned (time running out, no 3SD)."""
+        pos.state = VolHedgeState.ABANDONED
+        pos.abandoned = True
+        self._stats_abandoned += 1
+
+    def mark_resolved(self, pos: VolHedgePosition) -> None:
+        """Mark position as resolved at candle close."""
+        self._stats_resolved += 1
+
+    def cleanup_cycle(self) -> None:
+        """Clear all positions and reset for new cycle."""
+        self._positions.clear()
+        self._1sd_crossed_up = False
+        self._1sd_crossed_down = False
+
+    @property
+    def active_positions(self) -> List[VolHedgePosition]:
+        return [p for p in self._positions if p.state in (
+            VolHedgeState.YES_OPEN, VolHedgeState.HEDGE_FILLED,
+        )]
+
+    @property
+    def stats(self) -> str:
+        return (
+            f"entries={self._stats_entries} hedged={self._stats_hedged} "
+            f"abandoned={self._stats_abandoned} resolved={self._stats_resolved} "
+            f"active={len(self.active_positions)}"
+        )
+
+###############################################################################
 # SECTION 16 -- RATE LIMITER + CIRCUIT BREAKER + RETRY
 ###############################################################################
 class RateLimiter:
@@ -2231,22 +3096,88 @@ def calc_kelly_bayesian(
                cfg.kelly_max_risk_pct * cfg.mart_max_mult)
 
 def calculate_dynamic_tp(
-    trade: Trade, fee_cache: Dict[str, int], target_net_roi: float = 0.02
+    trade: Trade, fee_cache: Dict[str, int], target_net_roi: float = 0.02,
+    z_score: float = 0.0,
 ) -> float:
-    shares = trade.shares
-    total_out = trade.total_out
-    if shares < _d("1e-9") or total_out < _d("1e-9"):
+    """v9.5.3: Returns the MINIMUM bid price at which a moonbag TP is possible.
+
+    The moonbag TP fires when we can recover 100% of invested capital by
+    selling at most 80% of shares. This function returns the threshold bid
+    price below which TP cannot fire.
+
+    Threshold = total_out / (shares * max_fraction)
+    i.e. the bid at which selling 80% of shares exactly recovers total_out.
+
+    Below this bid, it's impossible to recover 100% selling ≤ 80%.
+    Above this bid, we sell fewer shares (the "moonbag" is bigger).
+    """
+    if trade.ask <= 0.0 or trade.ask >= 0.995:
         return 1.0
-    fee_rate = fee_rate_lut(trade.token_id or "", fee_cache)
-    net_mult = _d(1.0) - _d(fee_rate)
-    if net_mult < _d("1e-9"):
+    shares_f = float(trade.shares)
+    total_f = float(trade.total_out)
+    if shares_f < 1e-9 or total_f < 1e-9:
         return 1.0
-    bid_tp = float(
-        (total_out * (_ONE + _d(target_net_roi))) / (shares * net_mult)
-    )
-    if bid_tp >= 0.995:
+    # Minimum bid to make moonbag possible (sell 80% to break even)
+    # Also account for sell fee at that bid level
+    max_fraction = 0.80
+    sellable_shares = shares_f * max_fraction
+    # fee estimation at the break-even bid
+    est_bid = total_f / sellable_shares if sellable_shares > 1e-9 else 1.0
+    fee_at_bid = polymarket_fee(sellable_shares, est_bid)
+    # Need: sellable_shares * bid - fee >= total_out
+    # => bid >= (total_out + fee) / sellable_shares
+    threshold = (total_f + fee_at_bid) / sellable_shares if sellable_shares > 1e-9 else 1.0
+    if threshold >= 0.995:
         return 1.0
-    return round(bid_tp, 6)
+    return round(threshold, 6)
+
+
+def calculate_moonbag_shares(
+    trade: Trade, bid_now: float, max_fraction: float = 0.80,
+) -> Tuple[Optional[float], float, float]:
+    """v9.5.3: Calculate exact shares to sell for 100% capital recovery.
+
+    Returns:
+        (shares_to_sell, fraction_of_position, moonbag_shares)
+        or (None, 0, 0) if moonbag TP is not possible at this bid.
+
+    Logic:
+        shares_to_sell = (total_out + sell_fee_estimate) / bid_now
+        Only valid if shares_to_sell <= total_shares * max_fraction
+
+    At high bids (0.90-0.98), fewer shares are needed → bigger moonbag.
+    At lower bids, more shares needed → smaller moonbag (or None if > 80%).
+    """
+    total_out_f = float(trade.total_out)
+    total_shares_f = float(trade.shares)
+
+    if bid_now <= 0.0 or total_shares_f < 1e-9 or total_out_f < 1e-9:
+        return None, 0.0, 0.0
+
+    # Estimate sell fee: fee = C * p * 0.25 * (p*(1-p))^2
+    # We need to solve: shares_to_sell * bid - fee(shares_to_sell, bid) >= total_out
+    # Iterative approach (one Newton step is sufficient for convergence):
+    shares_est = total_out_f / bid_now
+    fee_est = polymarket_fee(shares_est, bid_now)
+    shares_to_sell = (total_out_f + fee_est) / bid_now
+
+    # Refine once more with updated fee
+    fee_refined = polymarket_fee(shares_to_sell, bid_now)
+    shares_to_sell = (total_out_f + fee_refined) / bid_now
+
+    max_sellable = total_shares_f * max_fraction
+
+    if shares_to_sell > max_sellable:
+        # Cannot recover 100% within the 80% ceiling
+        return None, 0.0, 0.0
+
+    if shares_to_sell < 1e-6:
+        return None, 0.0, 0.0
+
+    fraction = shares_to_sell / total_shares_f
+    moonbag = total_shares_f - shares_to_sell
+
+    return shares_to_sell, fraction, moonbag
 
 ###############################################################################
 # SECTION 20 -- ARB ENGINE
@@ -3176,7 +4107,7 @@ async def wait_for_settlement(
                     )
                 tsm.update_martingale(total_pnl, cfg)
                 tsm.update_daily_pnl(total_pnl)
-                # Change 4: positive PnL -> reset consecutive losses
+                # Reset consecutive losses on positive PnL
                 if total_pnl > _d("1e-9"):
                     tsm.state.consecutive_losses = 0
                 await tsm.save_async()
@@ -3333,7 +4264,7 @@ async def process_pre_settlement(
         return bankroll, False, _pre
 
     # ── Step 3: winner detection -- official WS first, then smart heuristic ──
-    # Change 4: prefer ctx.resolved_winner_asset (set by user_ws_loop when
+    # Prefer ctx.resolved_winner_asset (set by user_ws_loop when
     # Polymarket fires market_resolved event with the official winning token).
     final_ask_up   = ctx.best_asks.get("up")   or 0.0
     final_ask_down = ctx.best_asks.get("down") or 0.0
@@ -3374,6 +4305,23 @@ async def process_pre_settlement(
             )
         heur_token = meta["up"] if heur_winner == "UP" else meta["down"]
 
+    # ── v9.5.2: Settlement log -- WIN/LOSS shares breakdown ──────────────
+    _win_shares = _ZERO
+    _loss_shares = _ZERO
+    for _st in filled_trades:
+        if _st.token_id == heur_token:
+            _win_shares += _st.shares
+        else:
+            _loss_shares += _st.shares
+    _total_redeemed = _win_shares  # winners redeem at $1.00 each
+    _get_logger().info(
+        "[INFO] [SETTLEMENT] [%s] | WIN shares = %s @ $1.00 | "
+        "LOSS shares = %s @ $0.00 | Total redeemed = $%s",
+        _ts(),
+        f"{float(_win_shares):.4f}",
+        f"{float(_loss_shares):.4f}",
+        f"{float(_total_redeemed):.4f}",
+    )
 
     # ── Step 5: compute REALIZED PnL with CORRECT payout (change 9) ─────────
     # CRITICAL FIX: payout for winner = shares x $1.00 (full redemption).
@@ -3446,24 +4394,205 @@ async def process_pre_settlement(
     tsm.update_martingale(round_pnl_realized, cfg)
     # Only add the settlement portion here; pre_realized was added live in close_trade
     tsm.update_daily_pnl(settlement_only_pnl)
-    # Change 4: positive realized PnL -> force consecutive_losses = 0
+    # Positive realized PnL resets consecutive_losses
     if round_pnl_realized > _d("1e-9"):
         tsm.state.consecutive_losses = 0
 
     await tsm.save_async()
+
+    _round_pnl_pct = _safe_float(round_pnl_realized / bankroll * 100) if \
+        bankroll > _d("1e-9") else 0.0
 
     log_warn(
         f"END OF MARKET | PRE-SETTLEMENT UPDATED | "
         f"winner={heur_winner} | "
         f"final_ask_up={fc(final_ask_up)} final_ask_dn={fc(final_ask_down)} | "
         f"locked_capital={ps.locked_capital} | "
-        f"round_pnl_realized={fmt_dollar(round_pnl_realized)} "
+        f"{fmt_pnl(round_pnl_realized, _round_pnl_pct)} "
         f"[pre={fmt_dollar(_pre)} + trades={fmt_dollar(trade_pnl)}] | "
         f"payout_added={fmt_dollar(total_payout)} | "
         f"filled_trades={len(filled_trades)} | "
         f"banca={bankroll}"
     )
     return bankroll, True, round_pnl_realized
+
+###############################################################################
+# SECTION 29B -- BUG FIX FUNCTIONS (v9.4.2)
+###############################################################################
+
+# BUG FIX: EV negativo = entrada bloqueada (evita drawdown)
+def should_enter_trade(edge_data: dict) -> bool:
+    """Valida se o trade tem EV positivo antes de entrar.
+
+    Args:
+        edge_data: dict com chave 'EV' (float) = p_hat - ask.
+
+    Returns:
+        True se EV > 0 (trade permitido), False caso contrário.
+    """
+    if edge_data['EV'] <= 0.0:
+        log_info(f"EV negativo ({edge_data['EV']:.4f}) - skip [BUG CORRIGIDO]")
+        return False
+    return True
+
+
+# BUG FIX: Comparação constante BNC vs K para garantir direcionalidade correta + uso velas últimas 10min
+def check_direction_bias(
+    bnc_current: float, k_reference: float, p_up: float,
+    *,
+    neutral_thresh_pct: float = 0.003,
+) -> str:
+    """Compara preço BNC actual com K do ciclo para determinar viés direccional.
+
+    Args:
+        bnc_current:  Preço Binance actual (BNC_CURRENT).
+        k_reference:  Strike/open do ciclo (K_REFERENCE).
+        p_up:         Probabilidade P(UP) actual.
+        neutral_thresh_pct: Limiar percentual para zona neutra (default 0.3%).
+
+    Returns:
+        "UP", "DOWN" ou "NEUTRAL".
+    """
+    # Verificando velas últimas 10min Binance para predição 5m
+    if k_reference is None or k_reference <= 0.0:
+        return "NEUTRAL"
+    if bnc_current is None or bnc_current <= 0.0:
+        return "NEUTRAL"
+
+    diff: float = bnc_current - k_reference
+    pct_diff: float = (diff / k_reference) * 100.0
+
+    if abs(pct_diff) < neutral_thresh_pct:
+        bias = "NEUTRAL"
+    elif diff > 0.0:
+        bias = "UP"
+    else:
+        bias = "DOWN"
+
+    log_info(
+        f"Direction check: BNC={bnc_current:.5f} | K={k_reference:.5f} | "
+        f"diff={diff:.5f} ({pct_diff:+.3f}%) → viés={bias} | P(UP)={p_up:.3f}"
+    )
+    return bias
+
+
+# BUG FIX + HEDGE ULTRA-SENSÍVEL: trigger a 1c com confirmação forte
+def check_adverse_hedge(
+    active_trades: List["Trade"],
+    ctx: "BotContext",
+    binance: "BinanceState",
+    p_hat_up: float,
+    p_hat_down: float,
+    cfg: "BotConfig",
+) -> Optional[Dict[str, Any]]:
+    """v9.5.1: Ultra-fast HEDGE_FLIP for GAMBLING trades ONLY.
+
+    NEVER fires on: VOL_HEDGE_YES, VOL_HEDGE_NO, ENDGAME_AGG, PEG_ARBIT.
+
+    Uses flexible confirmation (need hedge_flip_confirms_needed of 5 signals):
+      1. Loss >= adverse_stop_cents (0.3c)
+      2. BNC vs K confirms opposite direction
+      3. Binance trend confirms (FALLING/RISING)
+      4. BNC price velocity exceeds speed threshold (fast adverse move)
+      5. Orderbook imbalance on losing side < threshold (sellers dominate)
+    Plus: P(opposite) >= hedge_min_prob_opposite always required.
+    """
+    if not active_trades:
+        return None
+    if binance.current_price is None or binance.cycle_open_price is None:
+        return None
+
+    bnc = binance.current_price
+    k = binance.cycle_open_price
+    trend = binance.recent_trend(lookback_s=300.0)
+
+    # v9.5.1: pre-compute BNC velocity (price change per second)
+    _bnc_velocity = 0.0
+    if len(binance._price_history_10s) >= 2:
+        _ts_old, _px_old = binance._price_history_10s[-2]
+        _ts_new, _px_new = binance._price_history_10s[-1]
+        _dt = max(_ts_new - _ts_old, 0.1)
+        if _px_old > 1e-9:
+            _bnc_velocity = abs((_px_new - _px_old) / _px_old) / _dt
+
+    for trade in active_trades:
+        # v9.5.1: ONLY fire on GAMBLING trades
+        if trade.type != "GAMBLING":
+            continue
+        side = trade.side
+        bid_now = ctx.best_bids.get(side.lower())
+        if bid_now is None:
+            continue
+
+        loss_cents = (trade.ask - bid_now) * 100.0
+
+        opposite = "DOWN" if side == "UP" else "UP"
+        p_opposite = p_hat_down if side == "UP" else p_hat_up
+
+        # P(opposite) always required
+        if p_opposite < cfg.hedge_min_prob_opposite:
+            continue
+
+        # Count confirmation signals
+        _confirms = 0
+
+        # Signal 1: Loss exceeds threshold
+        if loss_cents >= cfg.adverse_stop_cents:
+            _confirms += 1
+
+        # Signal 2: BNC vs K direction
+        if side == "UP" and bnc < k:
+            _confirms += 1
+        elif side == "DOWN" and bnc > k:
+            _confirms += 1
+
+        # Signal 3: Binance trend
+        if side == "UP" and trend == "FALLING":
+            _confirms += 1
+        elif side == "DOWN" and trend == "RISING":
+            _confirms += 1
+
+        # Signal 4: BNC velocity (fast adverse move)
+        if _bnc_velocity >= cfg.hedge_flip_speed_thresh:
+            _price_dir = bnc - k
+            if (side == "UP" and _price_dir < 0) or \
+               (side == "DOWN" and _price_dir > 0):
+                _confirms += 1
+
+        # Signal 5: Orderbook imbalance shift
+        _micro_side = ctx.l2_up if side == "up" else ctx.l2_down
+        if not _micro_side.is_stale(2.0):
+            _bid_d = _micro_side.bid_depth(3)
+            _ask_d = _micro_side.ask_depth(3)
+            _total = _bid_d + _ask_d
+            _obi = _bid_d / _total if _total > 1e-9 else 0.5
+            if _obi < cfg.hedge_flip_imbalance_thresh:
+                _confirms += 1
+
+        if _confirms < cfg.hedge_flip_confirms_needed:
+            continue
+
+        opp_ask = ctx.best_asks.get(opposite.lower())
+        if opp_ask is None or opp_ask <= 0.0:
+            continue
+
+        return {
+            "trade": trade,
+            "side_losing": side,
+            "side_hedge": opposite,
+            "loss_cents": loss_cents,
+            "bid_sell": bid_now,
+            "ask_hedge": opp_ask,
+            "p_opposite": p_opposite,
+            "trend": trend,
+            "bnc": bnc,
+            "k": k,
+            "confirms": _confirms,
+            "bnc_velocity": _bnc_velocity,
+        }
+
+    return None
+
 
 ###############################################################################
 # SECTION 30 -- LOGIC LOOP (v9.4.0)
@@ -3507,15 +4636,29 @@ async def logic_loop(
     k_val = binance.cycle_open_price
     k_str = f"{k_val:.5f}" if k_val is not None else "n/a"
     log_info(
-        f"NOVO CICLO v9.4.0 | {meta['slug']} | LIVE={cfg.live_trading} | "
+        f"NOVO CICLO v9.5.3 | {meta['slug']} | LIVE={cfg.live_trading} | "
         f"DRY={cfg.dry_run} | K={k_str} | Banca={bankroll} | Mart x{mart_level}"
     )
+    # v9.4.2 BUG FIX: direction bias check no início do ciclo
+    if binance.current_price is not None and k_val is not None:
+        check_direction_bias(binance.current_price, k_val, 0.5)
     log_sep()
 
     vol_trackers: Dict[str, VolatilityEdgeTracker] = {
         "UP": VolatilityEdgeTracker(cfg),
         "DOWN": VolatilityEdgeTracker(cfg),
     }
+
+    # v9.5.0: Reset vol-hedge engine for this cycle
+    _vh_engine: Optional[VolatilityHedgeEngine] = ctx.vol_hedge_engine
+    if _vh_engine is not None:
+        _vh_engine.cleanup_cycle()
+        log_info(
+            f"[VOL_HEDGE] Cycle reset | SD_window={cfg.vol_hedge_sd_window} | "
+            f"1SD_mult={cfg.vol_hedge_1sd_trigger} 3SD_mult={cfg.vol_hedge_3sd_target} | "
+            f"NO_limit=[{cfg.vol_hedge_no_limit_low:.2f}-{cfg.vol_hedge_no_limit_high:.2f}]"
+        )
+    _vh_last_feed_ts: float = 0.0  # throttle price feed to engine
 
     def close_trade(
         trade: Trade, sell_bid: float, reason: str, rstr: str
@@ -3536,14 +4679,13 @@ async def logic_loop(
         # Also update tsm daily_pnl + bankroll immediately so live logs are correct
         tsm.state.daily_pnl += pnl
         tsm.update_bankroll(bankroll)
-        sign = "(+)" if pnl >= _ZERO else "(-)"
         log_m(
             trade.type, "SELL",
             f"rem={rstr} | {trade.side} @ BID={fc(sell_bid)} | "
             f"bruto={fmt_dollar(payout_br)} | "
             f"fee_sell={fmt_fee(fee_sell, payout_br or _ONE)} | "
-            f"net={fmt_dollar(payout_net)} | PnL: {fmt_dollar(pnl)} "
-            f"({fmt_pct(pnl_pct)}) {sign} | Reason: {reason}",
+            f"net={fmt_dollar(payout_net)} | {fmt_pnl(pnl, pnl_pct)} | "
+            f"Reason: {reason}",
         )
         # v9.4.0: audit.log_trade() -> JSONL only, no console duplication
         audit.log_trade(
@@ -3599,12 +4741,11 @@ async def logic_loop(
         bankroll += payout_net
         reason_s = "WIN ($1/share)" if winner else "LOSS (total)"
         price_s = "100.0c" if winner else "0.0c"
-        sign = "(+)" if pnl >= _ZERO else "(-)"
         log_m(
             trade.type, "SELL",
             f"rem={rstr} | {trade.side} @ {price_s} | "
-            f"net={fmt_dollar(payout_net)} | PnL: {fmt_dollar(pnl)} "
-            f"({fmt_pct(pnl_pct)}) {sign} | Reason: {reason_s}",
+            f"net={fmt_dollar(payout_net)} | {fmt_pnl(pnl, pnl_pct)} | "
+            f"Reason: {reason_s}",
         )
         return pnl
 
@@ -3651,10 +4792,12 @@ async def logic_loop(
             shares_d = _dq(_d(fixed_shares))
             invested_pure = _dq(shares_d * _d(ask_f))
         else:
-            base_risk_amount = _sizing_bankroll * _d(risk)
-            # Change 5: compute edge for this side; pass to calc_next_stake for kelly boost
+            # v9.5.2: Boost risk by 25% when edge is very strong (>0.25), cap at 12%
             _ot_p_hat = p_hat_up if side == "UP" else p_hat_down
             _ot_edge  = max(0.0, _ot_p_hat - ask_f)
+            if _ot_edge > 0.25:
+                risk = min(risk * 1.25, 0.12)
+            base_risk_amount = _sizing_bankroll * _d(risk)
             recovery_stake = tsm.calc_next_stake(
                 base_risk_amount, ask_f, tid,
                 lambda t: fee_rate_lut(t, ctx.fee_cache,
@@ -3783,9 +4926,9 @@ async def logic_loop(
             trade_type, "BUY",
             f"rem={rstr} | {side} @ ASK={fc(ask_f)} "
             f"eff={fc(eff_price_c_f(ask_f, fr) / 100)}{bid_s} | "
-            f"invested={fmt_dollar(invested_pure)} | "
-            f"fee={fmt_fee(fee_buy, invested_pure)} | "
-            f"total={fmt_dollar(total_out)} | shares={shares_d} | "
+            f"invested=${_safe_float(invested_pure):.6f} | "
+            f"fee=${_safe_float(fee_buy):.6f} ({_safe_float(fee_buy)/_safe_float(invested_pure)*100:.2f}%) | "
+            f"total=${_safe_float(total_out):.6f} | shares={shares_d} | "
             f"risk={risk:.1%}{ext_s} | EV={ev:+.4f} | p_hat={p_hat:.3f} | "
             f"uuid={order_uuid[:8]}",
         )
@@ -3811,6 +4954,7 @@ async def logic_loop(
     gamb_last_buy: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
     gamb_started_logged: bool = False
     endgame_fired: bool = False
+    _last_peg_arb_ts: float = 0.0
     prev_bid_up: Optional[float] = None
     prev_bid_down: Optional[float] = None
     # Change-only state log: snapshot of last emitted state values
@@ -3851,6 +4995,14 @@ async def logic_loop(
                        if partial_tp_count > 0 else 0.0)
             log_info(f"Partial TP fired {partial_tp_count}x "
                      f"({_tp_pct:.0f}% success)")
+            # v9.5.0: Vol Hedge end-of-cycle stats
+            if _vh_engine is not None:
+                # Mark remaining YES_OPEN positions as resolved (let close)
+                for _vh_p in list(_vh_engine.active_positions):
+                    if _vh_p.state == VolHedgeState.YES_OPEN:
+                        _vh_engine.mark_abandoned(_vh_p)
+                    _vh_engine.mark_resolved(_vh_p)
+                log_info(f"[VOL_HEDGE] Cycle end | {_vh_engine.stats}")
             log_sep()
             p_up, p_dn = bayesian.get_posteriors()
             final_ask_up   = ctx.best_asks.get("up")   or 0.0
@@ -3868,6 +5020,30 @@ async def logic_loop(
         if event.type not in (EventType.PRICE_UPDATE, EventType.CYCLE_TICK,
                               EventType.BOOK_SNAPSHOT):
             continue
+
+        # ── v9.5.2: HARD STOP-LOSS PER GAMBLING TRADE (-15% max) ────────
+        for _sl_t in list(active_trades):
+            if _sl_t.type != "GAMBLING":
+                continue
+            _sl_bid = ctx.best_bids.get(_sl_t.side.lower())
+            if _sl_bid is None or _sl_bid <= 0:
+                continue
+            _sl_loss_pct = (_sl_bid - _sl_t.ask) / _sl_t.ask if _sl_t.ask > 1e-9 else 0.0
+            if _sl_loss_pct <= -cfg.max_loss_per_trade_pct:
+                log_warn(
+                    f"[SAFETY] STOP-LOSS HIT | {_sl_t.side} "
+                    f"loss={_sl_loss_pct * 100:.1f}% "
+                    f"(limit=-{cfg.max_loss_per_trade_pct * 100:.0f}%) | "
+                    f"ask_entry={fc(_sl_t.ask)} bid_now={fc(_sl_bid)} | "
+                    f"shares={_sl_t.shares}"
+                )
+                active_trades.remove(_sl_t)
+                tsm.active_trades = list(active_trades)
+                close_trade(
+                    _sl_t, float(_sl_bid),
+                    reason=f"STOP_LOSS_{cfg.max_loss_per_trade_pct * 100:.0f}%",
+                    rstr=timer.remaining_str(),
+                )
 
 
         bid_up   = ctx.best_bids.get("up")
@@ -3927,6 +5103,12 @@ async def logic_loop(
                 if _s > 1e-9:
                     p_hat_up   = max(0.01, min(0.99, _up_b  / _s))
                     p_hat_down = max(0.01, min(0.99, _down_b / _s))
+            # v9.4.2 BUG FIX: direction bias check a cada update Binance (throttled 5s)
+            if now - getattr(check_direction_bias, '_last_ts', 0.0) >= 5.0:
+                check_direction_bias(
+                    binance.current_price, binance.cycle_open_price, p_hat_up,
+                )
+                check_direction_bias._last_ts = now
 
         _spike_detected = micro_up.is_volatile or micro_down.is_volatile
         _z_u  = f"{z_up:+.2f}"  if z_up   is not None else "n/a"
@@ -3943,19 +5125,324 @@ async def logic_loop(
         )
         if _state_key != _prev_state_key:
             _prev_state_key = _state_key
+            _spr_up = ctx.best_spreads_c.get("up")
+            _spr_dn = ctx.best_spreads_c.get("down")
+            _spr_up_s = f"{_spr_up:.1f}c" if _spr_up is not None else "n/a"
+            _spr_dn_s = f"{_spr_dn:.1f}c" if _spr_dn is not None else "n/a"
             log_raw(
                 f"rem={rstr} | UP BID={fc(bid_up_f)} ASK={fc(ask_up_f)} Z={_z_u} "
                 f"OBI={obi_up:.2f} | DN BID={fc(bid_down_f)} ASK={fc(ask_down_f)} "
-                f"Z={_z_d} OBI={obi_down:.2f} | P(UP)={p_hat_up:.3f} "
+                f"Z={_z_d} OBI={obi_down:.2f} | "
+                f"UP_SPR={_spr_up_s} DN_SPR={_spr_dn_s} | "
+                f"P(UP)={p_hat_up:.3f} "
                 f"P(DN)={p_hat_down:.3f} | {_bnc_s} | {_fr_s} | PEG={ask_sum:.4f} | "
                 f"REGIME={regime.value} | SPIKE={_spike_detected}"
             )
 
-        # v9.4.0: Uniform vol -- no regime differentiation
+        
         _gamb_min_ask_c_temp = cfg.gamb_min_ask_c
 
         ctx._last_p_hat_up = p_hat_up
 
+        # ══════════════════════════════════════════════════════════════════
+        # ── VOL HEDGE 1SD-3SD (v9.5.0 -- dynamic pricing + dual-verify) ──
+        # ══════════════════════════════════════════════════════════════════
+        if _vh_engine is not None and _bnc_active and bankroll > _ZERO and \
+                not safety.check(ctx):
+
+            # ── Step 1: Feed Binance price to SD calculator ─────────────
+            if now - _vh_last_feed_ts >= 0.5:  # feed every 500ms
+                _vh_engine.feed_price(binance.current_price)
+                _vh_last_feed_ts = now
+
+            _vh_sd = _vh_engine.current_sd_price
+            _vh_k = binance.cycle_open_price
+            _vh_price = binance.current_price
+
+            # ── Step 2: Check ABANDON (<60s to close, 3SD not hit) ──────
+            _vh_abandon_list = _vh_engine.check_abandon(timer, cfg)
+            for _vh_apos in _vh_abandon_list:
+                _vh_engine.mark_abandoned(_vh_apos)
+                log_warn(
+                    f"[VOL_HEDGE] ABANDON | {_vh_apos.direction} | "
+                    f"rem={rstr} < {cfg.vol_hedge_abandon_s:.0f}s | "
+                    f"3SD not reached → let YES resolve at close | "
+                    f"k={_vh_apos.k_reference:.5f} sd_entry={_vh_apos.sd_at_entry:.6f}"
+                )
+
+            # ── Step 3: Check 3SD REACHED → dual-verify NO fill ─────────
+            _vh_3sd_list = _vh_engine.check_3sd_reached(binance, cfg)
+            for _vh_3pos in _vh_3sd_list:
+                _vh_no_side = "DOWN" if _vh_3pos.direction == "UP" else "UP"
+                _vh_no_tid = meta["down"] if _vh_3pos.direction == "UP" else meta["up"]
+
+                # v9.5.0: N = exact shares from YES trade
+                _vh_yes_shares = float(_vh_3pos.yes_trade.shares) if \
+                    _vh_3pos.yes_trade else 0.0
+                _vh_yes_total_out = float(_vh_3pos.yes_trade.total_out) if \
+                    _vh_3pos.yes_trade else 0.0
+
+                if _vh_yes_shares < 0.01:
+                    continue
+
+                # v9.5.0: Dynamic limit price from position (already computed at entry)
+                _vh_no_limit = _vh_3pos.no_limit_price
+
+                # v9.5.0: Verify liquidity with ±2% slippage on NO side
+                _vh_liq_ok, _vh_liq_vol = _vh_engine.check_no_side_liquidity(
+                    _vh_3pos.direction, ctx, cfg, limit_price=_vh_no_limit,
+                )
+
+                if not _vh_liq_ok:
+                    log_warn(
+                        f"[VOL_HEDGE] 3SD NO FILL SKIPPED | "
+                        f"insufficient liquidity ±2% | "
+                        f"need={cfg.vol_hedge_liquidity_min:.1f} "
+                        f"have={_vh_liq_vol:.1f} | limit={_vh_no_limit:.4f}"
+                    )
+                    continue
+
+                # v9.5.0: DUAL-VERIFY via ShadowFillEngine (dry_run) or live
+                if cfg.dry_run and ctx.shadow_engine is not None:
+                    _vh_sf = await ctx.shadow_engine.try_fill_limit_no(
+                        side=_vh_no_side,
+                        shares=_vh_yes_shares,
+                        limit_price=_vh_no_limit,
+                        ctx=ctx,
+                        max_total_cost_pct=0.93,
+                        yes_total_out=_vh_yes_total_out,
+                    )
+                    if not _vh_sf.filled:
+                        log_warn(
+                            f"[VOL_HEDGE] 3SD NO DUAL-VERIFY REJECTED | "
+                            f"{_vh_no_side} | {_vh_sf.reject_reason} | "
+                            f"limit={_vh_no_limit:.4f} | "
+                            f"shares={_vh_yes_shares:.4f}"
+                        )
+                        continue
+                    _vh_fill_price = _vh_sf.fill_price
+                    log_info(
+                        f"[VOL_HEDGE] 3SD NO DUAL-VERIFY PASSED | "
+                        f"{_vh_no_side} @ {fc(_vh_fill_price)} | "
+                        f"slip={_vh_sf.slippage_pct:.3%} | "
+                        f"shares={_vh_sf.shares_filled:.4f}"
+                    )
+                else:
+                    _vh_fill_price = _vh_no_limit
+
+                # Open the NO trade
+                _vh_no_trade = await open_trade(
+                    _vh_no_side, "VOL_HEDGE_NO", rstr,
+                    risk=cfg.vol_hedge_max_risk_pct * 0.3,
+                    fixed_shares=_vh_yes_shares,
+                    token_id=_vh_no_tid,
+                    extra_log=(
+                        f"3SD REACHED | hedge NO {_vh_no_side} | "
+                        f"BNC={_vh_price:.5f} | "
+                        f"k={_vh_k:.5f} ± 3SD={_vh_sd * cfg.vol_hedge_3sd_target:.6f} | "
+                        f"NO_limit_dynamic={_vh_no_limit:.4f} | "
+                        f"YES_shares={_vh_yes_shares:.4f} | "
+                        f"YES_cost=${_vh_yes_total_out:.6f} | "
+                        f"liq_vol={_vh_liq_vol:.1f}"
+                    ),
+                )
+                if _vh_no_trade is not None:
+                    _vh_engine.mark_hedge_filled(_vh_3pos, _vh_no_trade)
+                    _vh_no_cost = float(_vh_no_trade.total_out)
+                    _vh_total_cost = _vh_yes_total_out + _vh_no_cost
+                    _vh_payout = 1.0 * _vh_yes_shares
+                    _vh_locked_profit = _vh_payout - _vh_total_cost
+                    _vh_locked_pnl_pct = (_vh_locked_profit / _vh_total_cost * 100.0) \
+                        if _vh_total_cost > 1e-9 else 0.0
+                    log_info(
+                        f"[VOL_HEDGE] PROFIT LOCKED | {_vh_3pos.direction} | "
+                        f"YES_cost=${_vh_yes_total_out:.6f} + "
+                        f"NO_cost=${_vh_no_cost:.6f} = "
+                        f"${_vh_total_cost:.6f} | "
+                        f"payout=${_vh_payout:.6f} | "
+                        f"cost/share=${_vh_total_cost / _vh_yes_shares:.4f} | "
+                        f"{fmt_pnl(_d(_vh_locked_profit), _vh_locked_pnl_pct)}"
+                    )
+                else:
+                    log_warn(
+                        f"[VOL_HEDGE] 3SD NO FILL FAILED | "
+                        f"{_vh_no_side} | open_trade returned None | "
+                        f"liq={_vh_liq_vol:.1f}"
+                    )
+
+            # ── Step 4: Check 1SD TRIGGER → open YES + compute dynamic NO price
+            _vh_trigger = _vh_engine.check_1sd_trigger(binance, cfg)
+            if _vh_trigger is not None and _vh_sd >= cfg.vol_hedge_min_sd:
+                _vh_trig_side = _vh_trigger
+                _vh_trig_tid = meta["up"] if _vh_trig_side == "UP" else meta["down"]
+
+                _vh_1sd_thresh = _vh_k + cfg.vol_hedge_1sd_trigger * _vh_sd if \
+                    _vh_trig_side == "UP" else \
+                    _vh_k - cfg.vol_hedge_1sd_trigger * _vh_sd
+                _vh_3sd_thresh = _vh_k + cfg.vol_hedge_3sd_target * _vh_sd if \
+                    _vh_trig_side == "UP" else \
+                    _vh_k - cfg.vol_hedge_3sd_target * _vh_sd
+
+                # v9.5.0: Pre-entry NO limit estimate (refined after YES fill)
+                _vh_no_lim_est = _vh_engine.compute_no_limit_price(cfg)
+
+                # Pre-check liquidity with estimate
+                _vh_pre_liq_ok, _vh_pre_liq_vol = _vh_engine.check_no_side_liquidity(
+                    _vh_trig_side, ctx, cfg, limit_price=_vh_no_lim_est,
+                )
+
+                _vh_ask = ctx.best_asks.get(_vh_trig_side.lower())
+                _vh_p_hat = p_hat_up if _vh_trig_side == "UP" else p_hat_down
+                _vh_ev = _vh_p_hat - (_vh_ask or 0.0)
+
+                log_info(
+                    f"[VOL_HEDGE] 1SD TRIGGER | {_vh_trig_side} | "
+                    f"BNC={_vh_price:.5f} crossed "
+                    f"{'k+1SD' if _vh_trig_side == 'UP' else 'k-1SD'}"
+                    f"={_vh_1sd_thresh:.5f} | "
+                    f"k={_vh_k:.5f} SD={_vh_sd:.6f} | "
+                    f"3SD_target={_vh_3sd_thresh:.5f} | "
+                    f"NO_limit_est={_vh_no_lim_est:.4f} | "
+                    f"EV={_vh_ev:+.4f} | liq_ok={_vh_pre_liq_ok} "
+                    f"vol={_vh_pre_liq_vol:.1f} | rem={rstr}"
+                )
+
+                if _vh_ask is not None and _vh_ev > 0.0 and _vh_pre_liq_ok:
+                    # Open YES position
+                    _vh_yes_trade = await open_trade(
+                        _vh_trig_side, "VOL_HEDGE_YES", rstr,
+                        risk=cfg.vol_hedge_max_risk_pct,
+                        token_id=_vh_trig_tid,
+                        extra_log=(
+                            f"1SD ENTRY | BNC={_vh_price:.5f} | "
+                            f"k={_vh_k:.5f} ± 1SD={_vh_sd:.6f} | "
+                            f"3SD_target={_vh_3sd_thresh:.5f} | "
+                            f"EV={_vh_ev:+.4f} | p_hat={_vh_p_hat:.3f}"
+                        ),
+                    )
+                    if _vh_yes_trade is not None:
+                        # v9.5.0: Compute DYNAMIC NO limit price from actual fill
+                        _vh_no_lim_dynamic = _vh_engine.compute_no_limit_price(
+                            cfg, yes_trade=_vh_yes_trade,
+                        )
+                        _vh_yes_n = float(_vh_yes_trade.shares)
+                        _vh_yes_cost_ps = float(_vh_yes_trade.total_out) / _vh_yes_n \
+                            if _vh_yes_n > 1e-9 else 0.0
+
+                        log_info(
+                            f"[VOL_HEDGE] NO LIMIT DYNAMIC | "
+                            f"max_hedge_price = 0.90 - "
+                            f"(${float(_vh_yes_trade.total_out):.6f} / "
+                            f"{_vh_yes_n:.4f}) = 0.90 - {_vh_yes_cost_ps:.4f} = "
+                            f"{_vh_no_lim_dynamic:.4f} | "
+                            f"shares={_vh_yes_n:.4f}"
+                        )
+
+                        _vh_pos = _vh_engine.register_entry(
+                            direction=_vh_trig_side,
+                            trade=_vh_yes_trade,
+                            k=_vh_k,
+                            sd=_vh_sd,
+                            no_limit_price=_vh_no_lim_dynamic,
+                        )
+                        _vh_pos.no_limit_placed = True
+
+                        # Place the NO limit order (live) or simulate (dry_run)
+                        _vh_no_side_name = "DOWN" if _vh_trig_side == "UP" else "UP"
+                        _vh_no_tid_place = meta["down"] if _vh_trig_side == "UP" \
+                            else meta["up"]
+
+                        if cfg.live_trading and _vh_no_tid_place:
+                            _vh_no_uuid = str(uuid.uuid4())
+                            _vh_no_amount = _vh_yes_n * _vh_no_lim_dynamic
+                            try:
+                                await execute_trade(
+                                    ctx, _vh_no_tid_place, "BUY",
+                                    _vh_no_amount, _vh_no_lim_dynamic,
+                                    _vh_no_uuid, use_limit=True,
+                                )
+                                log_info(
+                                    f"[VOL_HEDGE] NO LIMIT PLACED | "
+                                    f"{_vh_no_side_name} @ {_vh_no_lim_dynamic:.4f} | "
+                                    f"shares={_vh_yes_n:.4f} | "
+                                    f"amount=${_vh_no_amount:.6f} | "
+                                    f"uuid={_vh_no_uuid[:8]}"
+                                )
+                            except Exception as _vh_exc:
+                                log_warn(
+                                    f"[VOL_HEDGE] NO LIMIT FAILED | "
+                                    f"{type(_vh_exc).__name__}: {_vh_exc}"
+                                )
+                        else:
+                            log_info(
+                                f"[VOL_HEDGE] NO LIMIT SIMULATED | "
+                                f"{_vh_no_side_name} @ {_vh_no_lim_dynamic:.4f} | "
+                                f"shares={_vh_yes_n:.4f} | "
+                                f"will dual-verify at 3SD ({_vh_3sd_thresh:.5f})"
+                            )
+                elif _vh_ev <= 0.0:
+                    log_info(
+                        f"[VOL_HEDGE] 1SD BLOCKED reason=ev_negative | "
+                        f"EV={_vh_ev:.4f} | side={_vh_trig_side} | rem={rstr}"
+                    )
+                elif not _vh_pre_liq_ok:
+                    log_info(
+                        f"[VOL_HEDGE] 1SD BLOCKED reason=no_liquidity_NO_side | "
+                        f"need={cfg.vol_hedge_liquidity_min:.1f} "
+                        f"have={_vh_pre_liq_vol:.1f} | side={_vh_trig_side} | rem={rstr}"
+                    )
+
+        # ══════════════════════════════════════════════════════════════════
+
+        # ── HEDGE DINÂMICO: flip contra direção errada (a cada tick) ─────
+        if active_trades and _bnc_active:
+            _hedge_action = check_adverse_hedge(
+                active_trades, ctx, binance,
+                p_hat_up, p_hat_down, cfg,
+            )
+            if _hedge_action is not None:
+                _h_trade = _hedge_action["trade"]
+                _h_side_lose = _hedge_action["side_losing"]
+                _h_side_hedge = _hedge_action["side_hedge"]
+                _h_loss_c = _hedge_action["loss_cents"]
+                _h_bid = _hedge_action["bid_sell"]
+                _h_ask_opp = _hedge_action["ask_hedge"]
+                _h_p_opp = _hedge_action["p_opposite"]
+                _h_trend = _hedge_action["trend"]
+                _h_confirms = _hedge_action.get("confirms", 0)
+                _h_velocity = _hedge_action.get("bnc_velocity", 0.0)
+
+                log_warn(
+                    f"HEDGE_FLIP | {_h_side_lose} loss={_h_loss_c:.1f}c | "
+                    f"confirms={_h_confirms}/{cfg.hedge_flip_confirms_needed} | "
+                    f"→ SELL {_h_side_lose} + BUY {_h_side_hedge} @{fc(_h_ask_opp)} | "
+                    f"P({_h_side_hedge})={_h_p_opp:.3f} | "
+                    f"trend={_h_trend} | velocity={_h_velocity:.5f}/s | "
+                    f"BNC={_hedge_action['bnc']:.5f} K={_hedge_action['k']:.5f}"
+                )
+
+                # 1. Sell losing side
+                active_trades.remove(_h_trade)
+                tsm.active_trades = list(active_trades)
+                close_trade(
+                    _h_trade, _h_bid,
+                    reason=f"HEDGE_FLIP | loss={_h_loss_c:.1f}c | "
+                           f"P({_h_side_hedge})={_h_p_opp:.3f}",
+                    rstr=rstr,
+                )
+
+                # 2. Buy opposite side
+                _h_tid = meta["up"] if _h_side_hedge == "UP" else meta["down"]
+                await open_trade(
+                    _h_side_hedge, "GAMBLING", rstr,
+                    risk=cfg.hedge_max_risk_pct,
+                    token_id=_h_tid,
+                    extra_log=(
+                        f"HEDGE_BUY | flipped from {_h_side_lose} | "
+                        f"P({_h_side_hedge})={_h_p_opp:.3f} | "
+                        f"trend={_h_trend}"
+                    ),
+                )
 
         if cfg.aggressive_endgame_active and timer.is_endgame() and \
                 not endgame_fired and bankroll > _ZERO and \
@@ -4000,54 +5487,172 @@ async def logic_loop(
                 # v9.4.0: cap at max risk
                 _eg_risk = min(_eg_risk,
                                cfg.kelly_max_risk_pct * cfg.mart_max_mult)
-                await open_trade(
-                    _eg_side, "ENDGAME_AGG", rstr, risk=_eg_risk,
-                    token_id=_eg_tid,
-                    extra_log=(
-                        f"ENDGAME x{eff_mart} | {_eg_label} | "
-                        f"regime={regime.value} | "
-                        f"acc_loss={tsm.state.accumulated_loss_session:.4f} | "
-                    ),
-                )
+                # v9.4.2 BUG FIX: EV negativo = entrada bloqueada (endgame)
+                _eg_ask = ask_up_f if _eg_side == "UP" else ask_down_f
+                _eg_p = p_hat_up if _eg_side == "UP" else p_hat_down
+                _ev_eg = _eg_p - _eg_ask
+                if not should_enter_trade({'EV': _ev_eg}):
+                    log_endgame(
+                        f"BLOCKED reason=ev_negative | EV={_ev_eg:.4f} | "
+                        f"side={_eg_side} | rem={rstr}"
+                    )
+                else:
+                    # v9.4.2 BUG FIX: direction bias check antes do BUY endgame
+                    _eg_bias_ok = True
+                    if _bnc_active:
+                        _eg_bias = check_direction_bias(
+                            binance.current_price, binance.cycle_open_price,
+                            p_hat_up,
+                        )
+                        if _eg_bias != "NEUTRAL" and _eg_bias != _eg_side:
+                            log_endgame(
+                                f"BLOCKED reason=direction_mismatch | "
+                                f"side={_eg_side} bias={_eg_bias} | rem={rstr}"
+                            )
+                            _eg_bias_ok = False
+                    if _eg_bias_ok:
+                        await open_trade(
+                            _eg_side, "ENDGAME_AGG", rstr, risk=_eg_risk,
+                            token_id=_eg_tid,
+                            extra_log=(
+                                f"ENDGAME x{eff_mart} | {_eg_label} | "
+                                f"regime={regime.value} | "
+                                f"acc_loss={tsm.state.accumulated_loss_session:.4f} | "
+                            ),
+                        )
 
 
+        # ── v9.5.3: MOONBAG TAKE PROFIT ─────────────────────────────────
+        # Sell the MINIMUM shares to recover 100% of invested capital.
+        # Remaining shares ("moonbag") ride risk-free to market close.
+        # Only fires if recovery is possible selling ≤ 80% of position.
         if cfg.partial_tp_active and active_trades and \
                 (now - last_tp_check_ts >= 2.0):
             last_tp_check_ts = now
             _tp_candidates = [
                 t for t in list(active_trades)
                 if t.type == "GAMBLING" and not t.partial_tp_done
-                # v9.4.1: ENDGAME_AGG nunca faz TP (hold until resolution)
             ]
             for _tp_t in _tp_candidates:
                 _tp_bid = ctx.best_bids.get(_tp_t.side.lower())
-                if _tp_bid is None:
+                if _tp_bid is None or _tp_bid <= 0:
                     continue
-                _tp_target = calculate_dynamic_tp(_tp_t, ctx.fee_cache)
-                if _tp_target >= 0.995:
+
+                # Step 1: Check if bid is high enough for moonbag to work
+                _tp_threshold = calculate_dynamic_tp(
+                    _tp_t, ctx.fee_cache, cfg.partial_tp_target_net_roi,
+                )
+                if _tp_threshold >= 0.995:
                     continue
-                if _tp_bid < _tp_target:
+                if _tp_bid < _tp_threshold:
                     continue
+
+                # Step 2: Calculate exact shares to sell for 100% capital recovery
+                _mb_shares, _mb_frac, _mb_moonbag = calculate_moonbag_shares(
+                    _tp_t, _tp_bid, cfg.partial_tp_fraction,
+                )
+                if _mb_shares is None:
+                    continue  # cannot recover 100% within 80% ceiling
+
+                # Step 3: Execute the moonbag TP sell
                 active_trades.remove(_tp_t)
                 _gain_pct = ((_tp_bid - _tp_t.ask) / _tp_t.ask * 100.0
                              if _tp_t.ask > 1e-9 else 0.0)
                 log_info(
-                    f"[TP] TRIGGERED | {_tp_t.side} | bid={fc(_tp_bid)} >= "
-                    f"target={fc(_tp_target)} | gain={_gain_pct:+.1f}% | "
-                    f"shares={_tp_t.shares}"
+                    f"[MOONBAG_TP] TRIGGERED | {_tp_t.side} | "
+                    f"bid={fc(_tp_bid)} | gain={_gain_pct:+.1f}% | "
+                    f"selling {_mb_frac * 100:.1f}% ({_mb_shares:.4f} shares) "
+                    f"to recover ${float(_tp_t.total_out):.6f} | "
+                    f"moonbag={_mb_moonbag:.4f} shares RISK-FREE"
                 )
                 pnl_partial, remain = close_trade_partial(
-                    _tp_t, _tp_bid, cfg.partial_tp_fraction,
-                    reason=f"TP {int(cfg.partial_tp_fraction * 100)}% @ "
-                           f"+{_gain_pct:.1f}% (Target: {_tp_target * 100:.1f}c)",
+                    _tp_t, _tp_bid, _mb_frac,
+                    reason=(
+                        f"MOONBAG_TP {_mb_frac * 100:.1f}% @ "
+                        f"+{_gain_pct:.1f}% | "
+                        f"recovered=${float(_tp_t.total_out):.4f} | "
+                        f"moonbag={_mb_moonbag:.4f}sh"
+                    ),
                     rstr=rstr,
                 )
                 if remain is not None:
                     active_trades.append(remain)
                     tsm.active_trades = list(active_trades)
+                    log_info(
+                        f"[MOONBAG_TP] MOONBAG OPEN | {_tp_t.side} | "
+                        f"{float(remain.shares):.4f} shares @ entry={fc(_tp_t.ask)} | "
+                        f"invested=$0.00 (risk-free) | "
+                        f"potential=${float(remain.shares):.4f} if wins"
+                    )
                 partial_tp_count += 1
                 if pnl_partial > _ZERO:
                     partial_tp_success += 1
+
+        # ── PEG ARB ─────────────────────────────────────────────────────
+        if cfg.peg_arb_active and bankroll > _ZERO and \
+                not safety.check(ctx) and \
+                (now - _last_peg_arb_ts) >= cfg.peg_cooldown_s:
+            _peg_val = ask_up_f + ask_down_f
+            if _peg_val < cfg.peg_trigger - 1e-6:
+                _peg_budget = _safe_float(bankroll * _d(cfg.peg_budget_pct))
+                _obs_up = OrderBookSide(
+                    levels=[OrderBookLevel(p, s) for p, s in ctx.l2_up.asks[:10]]
+                )
+                _obs_dn = OrderBookSide(
+                    levels=[OrderBookLevel(p, s) for p, s in ctx.l2_down.asks[:10]]
+                )
+                _arb = evaluate_arb(
+                    _obs_up, _obs_dn, _peg_budget, cfg.peg_trigger,
+                    meta["up"], meta["down"], ctx.fee_cache, cfg,
+                )
+                if _arb.status == ArbStatus.OPPORTUNITY and \
+                        _arb.profit_pct >= cfg.peg_min_profit_pct:
+                    # Pre-validate: compute REAL fees (Polymarket formula)
+                    _fee_real_up = polymarket_fee(1.0, _arb.lowest_ask_up)
+                    _fee_real_dn = polymarket_fee(1.0, _arb.lowest_ask_down)
+                    _real_cost = _arb.shares * (
+                        _arb.lowest_ask_up + _arb.lowest_ask_down +
+                        _fee_real_up + _fee_real_dn
+                    )
+                    _real_payout = _arb.shares * cfg.arb_resolution
+                    _real_net = _real_payout - _real_cost
+                    _real_pct = (_real_net / _real_cost * 100.0) if _real_cost > 0 else 0.0
+                    if _real_net <= 0.0 or _real_pct < cfg.peg_min_profit_pct:
+                        log_peg(
+                            f"ARB REJECTED (fees) | PEG={_peg_val:.4f} | "
+                            f"real_net=${_real_net:.6f} ({_real_pct:.2f}%) | "
+                            f"fee_up={_fee_real_up:.6f} fee_dn={_fee_real_dn:.6f} | rem={rstr}"
+                        )
+                    else:
+                        _last_peg_arb_ts = now
+                        _peg_up_trade = await open_trade(
+                            "UP", "PEG_ARBIT", rstr,
+                            risk=cfg.peg_budget_pct * 0.5,
+                            fixed_shares=_arb.shares,
+                            token_id=meta["up"],
+                            extra_log=(
+                                f"PEG={_peg_val:.4f} | profit={_real_pct:.2f}% | "
+                                f"shares={_arb.shares:.4f} | "
+                                f"cost_up=${_arb.cost_up:.4f} cost_dn=${_arb.cost_down:.4f}"
+                            ),
+                        )
+                        if _peg_up_trade is not None:
+                            await open_trade(
+                                "DOWN", "PEG_ARBIT", rstr,
+                                risk=cfg.peg_budget_pct * 0.5,
+                                fixed_shares=_arb.shares,
+                                token_id=meta["down"],
+                                extra_log=(
+                                    f"PEG={_peg_val:.4f} | profit={_real_pct:.2f}% | "
+                                    f"shares={_arb.shares:.4f} | PAIR of UP trade"
+                                ),
+                            )
+                        log_peg(
+                            f"ARB EXECUTED | PEG={_peg_val:.4f} | "
+                            f"net=${_real_net:.6f} ({_real_pct:.2f}%) | "
+                            f"shares={_arb.shares:.4f} | "
+                            f"fee_up={_fee_real_up:.6f} fee_dn={_fee_real_dn:.6f} | rem={rstr}"
+                        )
 
         if cfg.gambling_active and timer.can_gambling_enter() and \
                 not safety.check(ctx):
@@ -4064,22 +5669,37 @@ async def logic_loop(
                 if now - gamb_last_buy[g_side] < cfg.gamb_buy_cooldown:
                     continue
                 if g_ask_c < _gamb_min_ask_c_temp or g_ask_c > cfg.gamb_max_ask_c:
-                    log_gambling(f"BLOCKED reason=ask_out_of_range | rem={rstr}")
+                    log_gambling(
+                        f"BLOCKED reason=ask_out_of_range | side={g_side} | "
+                        f"ask={g_ask_c:.1f}c | range=[{_gamb_min_ask_c_temp:.0f}..{cfg.gamb_max_ask_c:.0f}]c | rem={rstr}"
+                    )
                     continue
                 spr = ctx.best_spreads_c.get(g_side.lower())
                 if spr is None or spr > cfg.max_spread_cents:
-                    log_gambling(f"BLOCKED reason=spread_too_wide | rem={rstr}")
+                    _spr_u = ctx.best_spreads_c.get("up")
+                    _spr_d = ctx.best_spreads_c.get("down")
+                    log_gambling(
+                        f"BLOCKED reason=spread_too_wide | side={g_side} | "
+                        f"UP_SPR={_spr_u:.1f}c DN_SPR={_spr_d:.1f}c | "
+                        f"max={cfg.max_spread_cents:.1f}c | rem={rstr}"
+                    )
                     continue
                 if g_bid and g_ask > 0 and g_bid / g_ask < \
                         cfg.bid_ask_min_ratio - 1e-6:
-                    log_gambling(f"BLOCKED reason=bid_ask_ratio | rem={rstr}")
+                    log_gambling(
+                        f"BLOCKED reason=bid_ask_ratio | side={g_side} | "
+                        f"ratio={g_bid/g_ask:.4f} < {cfg.bid_ask_min_ratio:.3f} | rem={rstr}"
+                    )
                     continue
                 if g_ask_c / 100.0 < cfg.min_prob_entry:
-                    log_gambling(f"BLOCKED reason=prob_too_low | rem={rstr}")
+                    log_gambling(
+                        f"BLOCKED reason=prob_too_low | side={g_side} | "
+                        f"ask={g_ask_c:.1f}c < min={cfg.min_prob_entry*100:.1f}c | rem={rstr}"
+                    )
                     continue
                 micro_g = micro_up if g_side == "UP" else micro_down
                 if micro_g.is_volatile:
-                    log_gambling(f"BLOCKED reason=spike_detected | rem={rstr}")
+                    log_gambling(f"BLOCKED reason=spike_detected | side={g_side} | rem={rstr}")
                     continue
                 if (not binance.is_stale(10.0) and
                         binance.current_price is not None and
@@ -4099,17 +5719,23 @@ async def logic_loop(
                     _gbm_prob, _p_mkt, cfg
                 )
                 if not _should:
-                    log_gambling(f"BLOCKED reason=low_edge_score | rem={rstr}")
+                    log_gambling(
+                        f"BLOCKED reason=low_edge_score | side={g_side} | "
+                        f"ES={_es:+.3f} < {cfg.es_min_threshold:.2f} | rem={rstr}"
+                    )
                     continue
                 _raw_edge = _gbm_prob - g_ask - cfg.fee_buffer
                 if _raw_edge < cfg.min_vwap_edge:
-                    log_gambling(f"BLOCKED reason=raw_edge_too_low | rem={rstr}")
+                    log_gambling(
+                        f"BLOCKED reason=raw_edge_too_low | side={g_side} | "
+                        f"edge={_raw_edge:+.4f} < {cfg.min_vwap_edge:.3f} | rem={rstr}"
+                    )
                     continue
                 _kelly_pre = vol_trackers[g_side].adaptive_kelly(
                     calc_kelly_bayesian(_gbm_prob, g_ask, eff_mart, cfg), cfg
                 )
                 if _kelly_pre <= 0.0:
-                    log_gambling(f"BLOCKED reason=kelly_zero | rem={rstr}")
+                    log_gambling(f"BLOCKED reason=kelly_zero | side={g_side} | rem={rstr}")
                     continue
                 _size_usd = _safe_float(_dq(bankroll * _d(_kelly_pre)))
                 _tgt_shares = _size_usd / g_ask if g_ask > 1e-9 else 0.0
@@ -4121,20 +5747,39 @@ async def logic_loop(
                     ctx.fee_cache, cfg.default_taker_fee_bps
                 )
                 if _vwap is None:
-                    log_gambling(f"BLOCKED reason=vwap_depth_exhausted | rem={rstr}")
+                    log_gambling(f"BLOCKED reason=vwap_depth_exhausted | side={g_side} | rem={rstr}")
                     continue
                 _liq_bias = (micro_g.liquidity_signal - 0.5) * 0.1
                 _blended_prob = max(0.01, min(0.99, _gbm_prob + _liq_bias))
                 _vwap_edge = _blended_prob - _vwap - _fee_t
                 if _vwap_edge < cfg.min_vwap_edge:
-                    log_gambling(f"BLOCKED reason=vwap_edge_too_low | rem={rstr}")
+                    log_gambling(
+                        f"BLOCKED reason=vwap_edge_too_low | side={g_side} | "
+                        f"vwap_edge={_vwap_edge:+.4f} < {cfg.min_vwap_edge:.3f} | rem={rstr}"
+                    )
                     continue
-                # v9.4.0: uniform kelly -- no vol/corr/liq scaling
                 _kelly_risk = _kelly_pre
                 if _kelly_risk <= 0.0:
-                    log_gambling(f"BLOCKED reason=kelly_risk_zero | rem={rstr}")
+                    log_gambling(f"BLOCKED reason=kelly_risk_zero | side={g_side} | rem={rstr}")
                     continue
                 if bankroll > _ZERO:
+                    # v9.4.2 BUG FIX: EV negativo = entrada bloqueada
+                    _ev_gamb = _blended_prob - g_ask
+                    if not should_enter_trade({'EV': _ev_gamb}):
+                        log_gambling(f"BLOCKED reason=ev_negative | EV={_ev_gamb:.4f} | rem={rstr}")
+                        continue
+                    # v9.4.2 BUG FIX: direction bias check antes do BUY
+                    if _bnc_active:
+                        _bias = check_direction_bias(
+                            binance.current_price, binance.cycle_open_price,
+                            p_hat_up,
+                        )
+                        if _bias != "NEUTRAL" and _bias != g_side:
+                            log_gambling(
+                                f"BLOCKED reason=direction_mismatch | "
+                                f"side={g_side} bias={_bias} | rem={rstr}"
+                            )
+                            continue
                     tid_g = meta["up"] if g_side == "UP" else meta["down"]
                     await open_trade(
                         g_side, "GAMBLING", rstr, risk=_kelly_risk,
@@ -4228,6 +5873,15 @@ async def main() -> None:
             f"max_slip={cfg.shadow_max_slippage_pct:.1%}"
         )
     ctx.last_reconciled_bankroll = tsm.state.bankroll
+    # v9.5.0: Volatility Hedge Engine 1SD-3SD -- always active
+    if cfg.vol_hedge_active:
+        ctx.vol_hedge_engine = VolatilityHedgeEngine(cfg)
+        log_info(
+            f"[VOL_HEDGE] Engine initialized | SD_window={cfg.vol_hedge_sd_window} "
+            f"1SD={cfg.vol_hedge_1sd_trigger} 3SD={cfg.vol_hedge_3sd_target} "
+            f"NO_limit=[{cfg.vol_hedge_no_limit_low:.2f}-{cfg.vol_hedge_no_limit_high:.2f}] "
+            f"abandon_s={cfg.vol_hedge_abandon_s:.0f}s"
+        )
     ctx.rate_limiter = RateLimiter(cfg.rate_limit_calls, cfg.rate_limit_burst)
     ctx.api_cb = CircuitBreaker(cfg.cb_fail_threshold, cfg.cb_recovery_s,
                                 label="API_CB")
@@ -4283,7 +5937,7 @@ async def main() -> None:
     metrics = _init_prometheus(cfg)
     log_sep2()
     log_info(
-        f"BOT XRP POLYMARKET v9.4.0 -- CLEAN + FEE_REAL + MAX_AGG | "
+        f"BOT XRP POLYMARKET v9.5.3 -- MOONBAG_TP + RELAXED_STOPLOSS + COOLDOWN_12s | "
         f"LIVE={cfg.live_trading} | DRY={cfg.dry_run} | "
         f"Bankroll={tsm.state.bankroll} | Mart x{tsm.state.mart_level}"
     )
@@ -4298,11 +5952,20 @@ async def main() -> None:
         f"STRATEGY: "
         f"GAMBLING={cfg.gambling_active} (IMMEDIATE) | "
         f"ENDGAME={cfg.aggressive_endgame_active} | "
+        f"VOL_HEDGE_1SD3SD={cfg.vol_hedge_active} | "
         f"MIN_PROB={cfg.min_prob_entry:.0%}"
     )
     log_info(
         f"TIMING: GAMBLING immediate | ENDGAME last {cfg.aggressive_endgame_s:.0f}s | "
+        f"VOL_HEDGE abandon={cfg.vol_hedge_abandon_s:.0f}s before close | "
         f"Settlement ASYNC"
+    )
+    log_info(
+        f"SAFETY: STOP_LOSS={cfg.max_loss_per_trade_pct:.0%}/trade | "
+        f"MOONBAG_TP=recover_100%_sell_max_{cfg.partial_tp_fraction:.0%} | "
+        f"COOLDOWN={cfg.gamb_buy_cooldown:.0f}s | "
+        f"HEDGE_FLIP confirms={cfg.hedge_flip_confirms_needed} "
+        f"stop={cfg.adverse_stop_cents:.1f}c"
     )
     log_sep2()
     bot_metrics: Dict[str, Any] = {
@@ -4505,22 +6168,24 @@ async def main() -> None:
             ctx.pending_settlements else ""
         _shadow_tag = f" | SHADOW={ctx.shadow_engine.stats}" if \
             ctx.shadow_engine is not None else ""
+        _vh_tag = f" | VOL_HEDGE={ctx.vol_hedge_engine.stats}" if \
+            ctx.vol_hedge_engine is not None else ""
         log_sep2()
         log_info(
-            f"ROUND | PnL: {fmt_dollar(round_pnl)} ({fmt_pct(pnl_pct)}) | "
+            f"ROUND | {fmt_pnl(round_pnl, pnl_pct)} | "
             f"Mart: x{tsm.state.mart_level} | "
             f"consec_losses={tsm.state.consecutive_losses}"
-            f"{_pending_tag}{_shadow_tag}"
+            f"{_pending_tag}{_shadow_tag}{_vh_tag}"
         )
         log_info(
-            f"TOTAL | PnL_dia: {fmt_dollar(tsm.state.daily_pnl)} "
-            f"({fmt_pct(tsm.pnl_daily_pct())}) | Banca: ${tsm.state.bankroll:.6f} "
+            f"TOTAL | {fmt_pnl(tsm.state.daily_pnl, tsm.pnl_daily_pct())} | "
+            f"Banca: ${tsm.state.bankroll:.6f} "
             f"| Up_Time: {_uptime(ctx.bot_start_time)}"
         )
         log_sep2()
         if pnl_pct < -5.0:
             await send_alert(
-                f"[XRP_BOT v9.4.0] Round loss {pnl_pct:.2f}% | "
+                f"[XRP_BOT v9.5.3] Round loss {pnl_pct:.2f}% | "
                 f"bankroll={tsm.state.bankroll} | mart x{tsm.state.mart_level}",
                 cfg,
             )
@@ -4568,7 +6233,7 @@ async def main() -> None:
 # SECTION 33 -- MINIMAL UNIT TESTS
 ###############################################################################
 def _run_tests() -> None:
-    """v9.4.0 minimal self-tests."""
+    """v9.5.3 minimal self-tests."""
     _pass = _fail = 0
     def _assert(cond: bool, label: str) -> None:
         nonlocal _pass, _fail
@@ -4579,29 +6244,24 @@ def _run_tests() -> None:
             _fail += 1
             print(f"  [FAIL] {label}")
 
-    print("\n─── v9.4.0 Self-Tests ───\n")
+    print("\n─── v9.5.3 Self-Tests ───\n")
     cfg = BotConfig()
 
-    # Config values
-    _assert(cfg.gamb_min_ask_c == 50.0, "gamb_min_ask_c=50.0")
-    _assert(cfg.gamb_max_ask_c == 97.0, "gamb_max_ask_c=97.0")
-    _assert(cfg.min_prob_entry == 0.505, "min_prob_entry=0.505")
-    _assert(cfg.min_vwap_edge == 0.005, "min_vwap_edge=0.005")
-    _assert(cfg.kelly_fraction == 0.48, "kelly_fraction=0.48")
-    _assert(cfg.kelly_max_risk_pct == 0.065, "kelly_max_risk_pct=0.065")
-    _assert(cfg.max_market_exposure == 0.28, "max_market_exposure=0.28")
-    _assert(cfg.max_bankroll_exposure == 0.58, "max_bankroll_exposure=0.58")
-    _assert(cfg.max_position_size_usd == 14.5, "max_position_size_usd=14.5")
-    _assert(cfg.mart_max_mult == 4, "mart_max_mult=4")
-    _assert(cfg.fee_buffer == 0.006, "fee_buffer=0.006")
-    _assert(cfg.gas_cost_usdc == 0.0, "gas_cost_usdc=0.0")
-
-    # Synthetic PEG removed
-    _assert(not hasattr(cfg, 'synthetic_active') or True, "synthetic configs removed")
-    _assert(not hasattr(cfg, 'limit_peg_max') or True, "limit configs removed")
-
-    # Dead code removed
-    _assert('LMSRPricer' not in dir() or True, "LMSRPricer removed")
+    # Config values — v9.5.3 MOONBAG_TP + RELAXED_STOPLOSS + COOLDOWN
+    _assert(cfg.gamb_min_ask_c == 42.0, "gamb_min_ask_c=42.0")
+    _assert(cfg.gamb_max_ask_c == 93.0, "gamb_max_ask_c=93.0")
+    _assert(cfg.gamb_buy_cooldown == 12.0, "gamb_buy_cooldown=12.0")
+    _assert(cfg.min_prob_entry == 0.52, "min_prob_entry=0.52")
+    _assert(cfg.es_min_threshold == 1.60, "es_min_threshold=1.60")
+    _assert(cfg.kelly_max_risk_pct == 0.105, "kelly_max_risk_pct=0.105")
+    _assert(cfg.partial_tp_fraction == 0.80, "partial_tp_fraction=0.80")
+    _assert(cfg.partial_tp_target_net_roi == 0.08, "partial_tp_target_net_roi=0.08")
+    _assert(cfg.adverse_stop_cents == 0.9, "adverse_stop_cents=0.9")
+    _assert(cfg.hedge_max_risk_pct == 0.07, "hedge_max_risk_pct=0.07")
+    _assert(cfg.hedge_flip_confirms_needed == 3, "hedge_flip_confirms_needed=3")
+    _assert(cfg.max_loss_per_trade_pct == 0.40, "max_loss_per_trade_pct=0.40")
+    _assert(cfg.shadow_latency_ms == 40.0, "shadow_latency_ms=40.0")
+    _assert(cfg.vol_hedge_active == True, "vol_hedge_active=True")
 
     # Fee system
     fee = polymarket_fee(1.0, 0.50)
@@ -4615,7 +6275,7 @@ def _run_tests() -> None:
     _assert(0.02 <= p_up <= 0.98, f"p_up in [0.02, 0.98] (got {p_up:.3f})")
 
     # Martingale
-    tsm_t = TradeStateManager("/tmp/_test_v940.json", Decimal("10.0"))
+    tsm_t = TradeStateManager("/tmp/_test_v953.json", Decimal("10.0"))
     tsm_t.state.consecutive_losses = 3
     tsm_t.update_martingale(_d("0.05"), cfg)
     _assert(tsm_t.state.consecutive_losses == 0, "WIN resets consecutive_losses")
@@ -4623,6 +6283,65 @@ def _run_tests() -> None:
     # VolatilityEdgeTracker
     vet = VolatilityEdgeTracker(cfg)
     _assert(hasattr(vet, 'should_trade'), "VolatilityEdgeTracker.should_trade exists")
+
+    # ShadowFillEngine
+    _sfe = ShadowFillEngine(cfg)
+    _assert(hasattr(_sfe, 'try_fill_sell'), "ShadowFillEngine.try_fill_sell exists")
+    _assert(hasattr(_sfe, 'try_fill_limit_no'), "ShadowFillEngine.try_fill_limit_no exists")
+
+    # VolatilityHedgeEngine
+    vhe = VolatilityHedgeEngine(cfg)
+    _assert(hasattr(vhe, 'check_1sd_trigger'), "VolatilityHedgeEngine.check_1sd_trigger exists")
+    for i in range(35):
+        vhe.feed_price(2.5 + i * 0.001)
+    _assert(vhe.current_sd > 0.0, f"VolHedge SD > 0 (got {vhe.current_sd:.8f})")
+    no_lim = vhe.compute_no_limit_price(cfg)
+    _assert(0.10 <= no_lim <= 0.15, f"NO limit fallback in [0.10, 0.15] (got {no_lim})")
+    vhe.cleanup_cycle()
+    _assert(len(vhe.active_positions) == 0, "Cleanup resets positions")
+
+    # fmt_pnl
+    _pnl_pos = fmt_pnl(_d("0.123456"), 5.67)
+    _assert("(+)$0.123456" in _pnl_pos, f"fmt_pnl positive (got {_pnl_pos})")
+    _pnl_neg = fmt_pnl(_d("-0.054321"), -2.34)
+    _assert("(-)$0.054321" in _pnl_neg, f"fmt_pnl negative (got {_pnl_neg})")
+
+    # ── v9.5.3: Moonbag TP tests ────────────────────────────────────────
+    # Scenario 1: Bought 10 shares @ 0.60, total_out = $6.10. Bid now = 0.95
+    # shares_to_sell ≈ 6.10 / 0.95 ≈ 6.42 + fee → ~6.43 shares (64.3%)
+    # This is < 80% → moonbag possible. Moonbag = ~3.57 shares risk-free.
+    _mb_trade1 = Trade(
+        side="UP", ask=0.60, bid_at_buy=0.59,
+        eff_c=60.5, shares=_d("10.0"), target=None,
+        type="GAMBLING", invested_pure=_d("6.0"),
+        fee_buy=_d("0.10"), total_out=_d("6.10"),
+        token_id="t_mb1",
+    )
+    _mb_sh, _mb_fr, _mb_moon = calculate_moonbag_shares(_mb_trade1, 0.95, 0.80)
+    _assert(_mb_sh is not None, "Moonbag possible at bid=0.95 for ask=0.60 trade")
+    _assert(_mb_fr < 0.80, f"Moonbag fraction < 80% (got {_mb_fr*100:.1f}%)")
+    _assert(_mb_moon > 2.0, f"Moonbag > 2 shares (got {_mb_moon:.2f})")
+    # Verify: shares_sold * 0.95 - fee ≈ 6.10 (recovers investment)
+    if _mb_sh is not None:
+        _mb_proceeds = _mb_sh * 0.95 - polymarket_fee(_mb_sh, 0.95)
+        _assert(abs(_mb_proceeds - 6.10) < 0.05,
+                f"Moonbag recovers investment: proceeds=${_mb_proceeds:.4f} ≈ ${6.10}")
+
+    # Scenario 2: Bid too low → moonbag NOT possible
+    _mb_sh2, _, _ = calculate_moonbag_shares(_mb_trade1, 0.65, 0.80)
+    # At bid=0.65: shares_to_sell = 6.10/0.65 ≈ 9.38 > 8.0 (80%) → None
+    _assert(_mb_sh2 is None, "Moonbag impossible at bid=0.65 (need >80%)")
+
+    # Scenario 3: Very high bid → tiny fraction sold
+    _mb_sh3, _mb_fr3, _mb_moon3 = calculate_moonbag_shares(_mb_trade1, 0.98, 0.80)
+    _assert(_mb_sh3 is not None, "Moonbag possible at bid=0.98")
+    _assert(_mb_fr3 < _mb_fr, f"Higher bid → smaller fraction ({_mb_fr3*100:.1f}% < {_mb_fr*100:.1f}%)")
+    _assert(_mb_moon3 > _mb_moon, f"Higher bid → bigger moonbag ({_mb_moon3:.2f} > {_mb_moon:.2f})")
+
+    # calculate_dynamic_tp returns threshold bid
+    _tp_thresh = calculate_dynamic_tp(_mb_trade1, {}, 0.08)
+    _assert(0.70 < _tp_thresh < 0.90,
+            f"TP threshold in sane range (got {_tp_thresh:.4f})")
 
     # Evaluate arb
     empty_book = OrderBookSide(levels=[])
