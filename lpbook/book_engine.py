@@ -41,7 +41,8 @@ class MarketState:
 
 class BookEngine:
     def __init__(self, st: MarketState, max_skew_c, inv_cap, hawkes: HawkesBurst,
-                 c_loss, a_fill, k_fill, dither_c: float = 0.0, signal=None):
+                 c_loss, a_fill, k_fill, dither_c: float = 0.0, signal=None,
+                 budget=None, min_move_c: float = 0.1):
         self.st = st
         self.max_skew_c = max_skew_c
         self.inv_cap = inv_cap
@@ -51,6 +52,8 @@ class BookEngine:
         self.k_fill = k_fill
         self.dither_c = dither_c                # amplitude do dithering de delta (c)
         self.signal = signal                    # ToxicitySignal opcional (custo, nao skew)
+        self.budget = budget                    # Budget opcional (order/cancel por tier)
+        self.min_move_c = min_move_c            # tick assumido; ajustar ao mercado
         self.cost_mult = 1.0                    # ultimo multiplicador aplicado (para a TUI)
         self._dither_phase = 0
         self._buckets: dict[float, list] = {}   # distancia ao mid -> [fills, segundos]
@@ -96,7 +99,10 @@ class BookEngine:
         # algum reward por estar fora do otimo parte do tempo, e compra-se a
         # informacao que diz onde o otimo esta. O regime acima e classificado no
         # delta* verdadeiro, nao no dithered.
-        if self.dither_c > 0.0:
+        # O dithering cede ao orcamento: cada fase nova forca um requote real
+        # (2 cancelamentos + 2 ordens). Sem folga no tier, cota-se no delta* e nao
+        # se recolhe informacao neste ciclo -- ficar de pe vale mais.
+        if self.dither_c > 0.0 and (self.budget is None or self.budget.can_afford(now)):
             self._dither_phase = (self._dither_phase + 1) % 4
             offset = self.dither_c * (-1.5, -0.5, 0.5, 1.5)[self._dither_phase]
             d = min(max(d + offset, 0.0), self.st.max_spread_c)
@@ -105,15 +111,37 @@ class BookEngine:
         if self.withdrawn:
             d = self.st.max_spread_c
         r = reservation_mid_c(mid_c, self.st.inv, self.inv_cap, max_skew_c)
-        self.st.delta_c = d
         # O skew desloca as pernas para r +/- d, logo a d +/- skew do mid VERDADEIRO:
         # sem limite, a perna do lado contrario ao inventario sai da band. Fora da
         # band a perna marca zero e, na banda extrema (mid < 10c), Q_min = min(dois
         # lados) = 0 -- o par inteiro deixa de pontuar por causa de uma perna. Manter
         # ambas dentro da band; o skew gasta-se do orcamento da band, nao alem dele.
         band = self.st.max_spread_c
-        self.st.bid = Leg("bid", max(r - d, mid_c - band), self.st.size)
-        self.st.ask = Leg("ask", min(r + d, mid_c + band), self.st.size)
+        alvo_bid = max(r - d, mid_c - band)
+        alvo_ask = min(r + d, mid_c + band)
+
+        # Repor as pernas custa 2 cancelamentos + 2 ordens contra o tier do signer.
+        # Nao se gasta orcamento por movimentos abaixo do tick, e se o tier nao der
+        # mantem-se as pernas antigas: ficar de pe com uma cotacao um pouco velha
+        # pontua mais do que ficar sem pernas (o uptime pontua diretamente).
+        if not self._move_material(alvo_bid, alvo_ask):
+            return
+        if self.budget is not None and not self.withdrawn:
+            if not self.budget.can_afford(now):
+                self.budget.deny()
+                return
+            self.budget.spend(now)
+        self.st.delta_c = d
+        self.st.bid = Leg("bid", alvo_bid, self.st.size)
+        self.st.ask = Leg("ask", alvo_ask, self.st.size)
+
+    def _move_material(self, alvo_bid: float, alvo_ask: float) -> bool:
+        """Vale a pena cancelar e repor? Abaixo do tick e churn puro: gasta
+        orcamento, arrisca a fila, e nao muda o score de forma mensuravel."""
+        if self.st.bid is None or self.st.ask is None:
+            return True
+        return (abs(alvo_bid - self.st.bid.level_c) >= self.min_move_c
+                or abs(alvo_ask - self.st.ask.level_c) >= self.min_move_c)
 
     def on_fill(self, side, shares, price_c, adverse_c, now, delta_c) -> None:
         """`delta_c` e a distancia a que a perna estava do mid quando encheu, dada

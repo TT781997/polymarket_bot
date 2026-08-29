@@ -315,6 +315,63 @@ da band. As peças foram portadas por cima da versão corrigida, não o contrár
 biblioteca padrão** — uma armadilha latente para qualquer coisa que precise de tratar sinais.
 Renomeado para `toxicity.py`.
 
+### 0.9 Os dois bloqueios do `live` — orçamento de ordens e caminho de fills
+
+Ficavam por resolver os dois itens da §0.6 que impedem o `live` de ser real.
+
+**Orçamento de order/cancel (§4, §7).** Um requote custa 2 cancelamentos + 2 ordens contra o tier do
+signer. O dithering da §0.7 tornou isto mais urgente, não menos: cada ciclo passa a mexer mesmo as
+pernas, portanto gasta sempre. `budget.py` implementa uma **janela deslizante real** (deque de
+timestamps, não um contador que reinicia — um contador por minuto de relógio deixa passar o dobro do
+limite na fronteira). O `requote` consulta-a e degrada por camadas:
+
+1. movimento abaixo do tick → não repõe (churn puro: gasta orçamento, arrisca a fila, não muda o
+   score de forma mensurável);
+2. sem orçamento → **mantém as pernas antigas**. Ficar de pé com uma cotação um pouco velha pontua;
+   ficar sem pernas não pontua nada (o uptime pontua diretamente, §4). O pior caso — cancelar e
+   depois não conseguir repor — fica excluído por construção;
+3. o **dithering cede ao orçamento**: sem folga, cota-se no δ\* e não se recolhe informação neste
+   ciclo.
+4. a retirada por burst (§3.5) **ignora** o orçamento: é ação de risco, não de otimização.
+
+Medido em 24 h simuladas (o loop pede ~3 requotes/min):
+
+| ordens/min | requotes travados | líquido |
+|---|---|---|
+| 30 (folgado) | 0 | $5.34 |
+| 4 | 1285 | $5.08 |
+| 2 | 2729 | $4.91 |
+
+Degrada suavemente (−5% e −8%) em vez de partir. **Os limites reais por tier do Polymarket não estão
+codificados** — não foi possível confirmá-los — por isso o default é deliberadamente conservador
+(30/min) e os números passam-se em `--orders-per-min` / `--cancels-per-min`. A ferramenta nunca deve
+ser a primeira a descobrir o teto.
+
+**Caminho de fills em `live` — e uma assimetria séria entre paper e live.** No `paper` o gerador
+devolve o movimento adverso **no mesmo instante** do fill. Em live isso é impossível: no momento em
+que enches só sabes o preço a que encheste; o movimento adverso é o que o mid faz **a seguir** — é a
+própria definição de seleção adversa. Ligar o WS de user de forma ingénua (adverse = 0 no instante
+do fill) faria a ferramenta concluir que **os fills são grátis**, que é exatamente o erro que ela
+existe para evitar, e o `rho` deixaria de rejeitar seja o que for.
+
+`live_fills.py` resolve isso com uma fila: o fill entra pendente, e só é liquidado depois de um
+horizonte, com o deslocamento do mid medido. Decisões que valem a pena registar:
+
+- **O adverso é sinalizado**, não clampado a zero: um fill que correu bem entra negativo e baixa o
+  custo medido. Clampar enviesava o custo para cima e fazia rejeitar mercados bons.
+- **Mas o `c_loss` entregue ao optimizer nunca é negativo** — um custo negativo inverteria o termo e
+  o optimizer passaria a *querer* fills, o oposto de tudo o que a ferramenta faz.
+- **O parser nunca inventa um fill.** Uma mensagem nossa que não se consegue ler conta em
+  `nao_parseadas` em vez de virar um fill com campos adivinhados.
+
+O envelope segue o que os bots deste repo já fazem (`xrp_bot_v9_4_1.py:2920`): dict ou lista de
+dicts discriminados por `event_type`, com `asset_id`, auth L2 no connect, PING/PONG a 4 s, reconexão
+com backoff. **Os campos da mensagem de trade não foram confirmados** contra a doc — os bots do repo
+só tratam `market_resolved` e `taker_fee_rate_bps` no canal de user — por isso o parser exige
+explicitamente o que precisa e conta o resto. O que falta para o `live` funcionar é **só o
+transporte**: ligar o listener WS e encaminhar para `router.on_message()`. A lógica está testada
+offline (`test_live.py`).
+
 ---
 
 ## 1. Objetivo
