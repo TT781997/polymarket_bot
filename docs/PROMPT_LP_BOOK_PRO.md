@@ -1,8 +1,11 @@
 # Prompt Master — LP BOOK PRO
 
-**Estado:** especificação para uma sessão de construção futura. **Não é código implementado.**
-Nada neste repo executa LP farming hoje.
+**Estado:** especificação, agora com uma implementação de referência em `lpbook/` (13 ficheiros,
+1089 linhas). Os testes das partes puras passam e o modo `paper` corre de ponta a ponta; `scan` e
+`live` precisam da rede do Polymarket e não foram exercitados.
 **Verificado contra o repo em:** 29/08/2026 (commit `9d2bc33`).
+**Revisto contra a implementação em:** 29/08/2026 — a tese "existe sempre δ\* interior" **caiu**
+(secção 0.5), e a calibração de `k` tem um problema de identificação por resolver (secção 0.6).
 **Como usar:** colar as secções 1–11 como instrução numa sessão nova. Ler primeiro a secção 0 —
 o prompt original citava infraestrutura deste repo que não existe, e as correções estão lá.
 
@@ -109,6 +112,104 @@ aproximação de primeira ordem válida enquanto a nossa fatia for pequena face 
 Re-resolver `delta*` a cada requote, com o `R` do estado competitivo observado nessa amostra, e
 não uma vez por sessão.
 
+> **Superado pela implementação:** esta análise fechada vale para o objetivo tal como escrito na
+> secção 3.1. A implementação substituiu esse objetivo (share explícita + fator de permanência na
+> band — ver 0.5), e a forma resultante já não é analítica. `lpbook/optimizer.py` resolve por grelha
+> de 240 pontos mais refinamento por secção áurea, o que é a escolha certa para uma forma
+> desconhecida. Mantém-se aqui porque a conclusão estrutural — **o ótimo pode ser um canto, e a
+> bissecção ingénua encontra o mínimo** — foi o que a implementação confirmou.
+
+### 0.5 Os três regimes (a tese corrigida)
+
+O objetivo da secção 3.1 é incompleto: sem penalizar a borda, o ótimo degenera para lá em mercados
+finos (a receita achata mas o custo continua a cair). Falta o termo que o próprio material de origem
+descreve — perto da borda, o **drift do mid empurra a perna para fora da band e passa a marcar
+zero**. O objetivo completo, que é o que `lpbook/optimizer.py` implementa:
+
+```
+s(d)      = size * ((D - d)/D)^2                    # score quadratico
+g(d)      = 2*Phi((D - d)/sd) - 1                   # P(fica na band apesar do drift)
+reward(d) = pool_ps * s(d)/(s(d) + q_others) * g(d) # share EXPLICITA, $/s
+cost(d)   = c_loss * A * exp(-k*d)                  # $/s
+U(d)      = reward(d) - cost(d)
+```
+
+Duas coisas mudam face à secção 3.1: a share entra explicitamente (`s/(s+q_others)`, saturante — é
+o que faz o size ter retornos decrescentes) e `g(d)` penaliza a borda. Com isto, o ótimo cai num de
+**três regimes**, e não num "interior sempre positivo":
+
+| regime | onde | quando |
+|---|---|---|
+| **MID** (`δ* ≈ 0`) | em cima do mid | custo de fill desprezável e pool rico — o mid é mesmo o melhor |
+| **INTERIOR** (`0 < δ* < D`) | recuo intermédio | `k` alto: os fills concentram-se no mid, recuar um cabelo evita a toxicidade sem perder share |
+| **BORDA** (`δ* ≈ D`) | encostado à borda | fino ou tóxico — na prática **não farmar**; o `rho` rejeita |
+
+Varrimento que corri para localizar as fronteiras (`D=2c`, `size=200`, `q_others=3000`, `A=0.02`,
+`sd=0.6c`; `U*` anualizado a $/dia):
+
+| pool $/d | k | c_loss | δ\* | regime | U\* |
+|---|---|---|---|---|---|
+| 5000 | 0.9 | 0.05 | 0.000c | MID | +225.83 |
+| 5000 | 0.9 | 1.8 | 2.000c | BORDA | −514.15 |
+| 5000 | 6.0 | 1.8 | 0.748c | INTERIOR | +87.63 |
+| 480 | 0.9 | 0.05 | 2.000c | BORDA | −14.28 |
+| 480 | 3.0 | 0.05 | 0.882c | INTERIOR | +3.06 |
+| 480 | 6.0 | 1.8 | 1.215c | INTERIOR | +1.83 |
+| 21.6 | 3.0 | 0.05 | 2.000c | BORDA | −0.21 |
+| 21.6 | 6.0 | 0.05 | 1.110c | INTERIOR | +0.13 |
+| 21.6 | 6.0 | 1.8 | 2.000c | BORDA | −0.02 |
+
+Leitura honesta destes números — **não é "o k decide tudo"**:
+
+- **`k` decide se o INTERIOR existe.** Com `k = 0.9` não há um único interior no varrimento: só MID
+  ou BORDA. Com `k = 6` (fills muito concentrados no mid) o interior aparece em quase todo o lado.
+  É por isto que calibrar o `k` é a joia da coroa e não um rodapé: é o parâmetro que diz se existe
+  sequer um sítio inteligente onde pousar.
+- **A razão reward/custo decide MID vs BORDA.** Com o mesmo `k = 0.9`, pool rico e custo baixo dá
+  MID; pool fino ou custo alto dá BORDA. O `k` não distingue estes dois.
+- **BORDA implica sempre prejuízo, por construção.** Em `δ = D` o score é zero **e** `g(D) = 0`,
+  logo `U(D) = −c_loss·A·e^(−kD) < 0` sempre. "O ótimo é a borda" é sinónimo de "este mercado não se
+  farma" — o mesmo veredito que o `rho` dá, por outro caminho. Isto é teorema, não acidente do
+  varrimento.
+- O rótulo MID/INTERIOR usa um corte em `0.05·D`: é uma etiqueta sobre um contínuo, não uma
+  descontinuidade física. O caso `δ* = 0.100c` acima está no limiar.
+
+### 0.6 O que a verificação da implementação encontrou
+
+Corri os testes (8/8 passam) e o modo `paper` de ponta a ponta. Confirmei os números reportados:
+a $20 de bankroll o scan rejeita 4 dos 5 mercados sintéticos e arma o qualifier de ténis de baixa
+competição (pool $12/dia, δ\* MID, net +$2.89/dia, `rho` 0.52). Três achados que não estavam
+assinalados:
+
+1. **A calibração de `k` não arranca sozinha — problema de identificação.** No fim de uma corrida
+   `paper` de 2 h com 7 fills, o output foi `A/k calibrados: A=0.0004 k=0.900 (priors A=0.0004
+   k=0.9)`: os priores intactos. A causa está em `book_engine.py:56` e `:81` — o bucket é indexado
+   por `round(self.st.delta_c, 1)`, o δ **corrente**. Como a política converge para um único δ, todos
+   os fills caem num só bucket, a regressão fica com `sxx = 0` e `calibrate_ak` devolve `None` para
+   sempre. **Não se pode estimar o declive de `λ(δ)` a partir de fills recolhidos todos ao mesmo δ.**
+   Pior: as duas pernas ficam em `r ± d` à volta do mid **enviesado** (`book_engine.py:75-76`), ou
+   seja a distâncias diferentes do mid verdadeiro — e o executor até usa essa distância assimétrica
+   para gerar o fill (`execution.py:25,30`) — mas o bucket deita a assimetria fora ao indexar pelo
+   `d` simétrico. Duas correções, por ordem de retorno: (a) indexar o bucket pela distância real
+   **de cada perna** ao mid, o que já dá dois pontos de regressão de graça; (b) dithering deliberado
+   do δ entre requotes (as "sondas controladas" da secção 3.3), porque sem variação imposta não há
+   informação para identificar `k`. Enquanto isto não estiver feito, a ferramenta corre nos priores
+   — e como a secção 0.5 mostra que é o `k` que decide o regime, correr com um `k` assumido é
+   estruturalmente o mesmo erro do vídeo, só que mais bem documentado.
+2. **Sem WebSocket e sem asyncio.** `data_feed.py` é REST síncrono (`httpx`), tanto para o Gamma
+   como para o book (`/book?token_id=`). A secção 6 pede CLOB WS para book/mid ao vivo, e o resto do
+   repo é todo asyncio. Com polling REST, o uptime — que a secção 4 diz pontuar diretamente — fica
+   refém do intervalo de poll. `LiveExecutor.poll_fills()` devolve `[]` com um comentário a dizer
+   que é preciso ligar o WS de user: em `live`, hoje, o inventário, o skew e a calibração **não
+   recebem fills nenhuns**.
+3. **Sem contabilidade de order/cancel budget.** Não há nada no código a contar ordens ou
+   cancelamentos, e `LiveExecutor.place()` faz `cancel_all()` a cada requote. As secções 4 e 7 exigem
+   dimensionar o loop ao tier do signer. É o tipo de teto que se descobre numa sessão volátil, que é
+   exatamente o que a secção 4 avisa para não fazer.
+
+Nota de dependências: `lpbook/` traz `httpx` e `rich`, nenhuma delas usada pelos bots XRP (que usam
+`requests` e `websockets`). Ver `lpbook/README.md`.
+
 ---
 
 ## 1. Objetivo
@@ -126,9 +227,16 @@ seleciona mercados por rendimento líquido ajustado ao risco, não por tamanho b
 
 Por que é superior, em três linhas:
 
-- coloca em δ\* (solução interior > 0), não em cima do mid;
+- coloca em δ\* **decidido por mercado** — MID, INTERIOR ou BORDA conforme o `k` medido e a razão
+  reward/custo (secção 0.5) — em vez de assumir o mid como a referência faz às cegas;
 - calibra A e k a partir de fills reais e adapta-se à competição observada;
 - seleciona e ordena mercados por líquido esperado, com guardrail de perda-por-fill sobre reward diário.
+
+> **Corrigido:** a primeira linha dizia "coloca em δ\* (solução interior > 0), não em cima do mid".
+> Falso — a implementação provou que o ótimo é frequentemente um canto. Ver secção 0.5. A diferença
+> face ao vídeo não é *onde* se coloca, é que se **preça o custo de fill antes de decidir**: quando
+> o resultado é o mid, é o mid com prova; o vídeo senta-se no mid sem a fazer, e nos mercados
+> tóxicos é arrasado.
 
 ---
 
@@ -175,6 +283,14 @@ U(delta) = R * ((D - delta) / D)^2  -  C * A * exp(-k * delta)
 - `A, k` — parâmetros da intensidade de fill `lambda(delta) = A * exp(-k*delta)`;
 - `C` — perda esperada por fill adverso (mark contra a posição após encher).
 
+> **Corrigido (implementação):** este objetivo está incompleto e degenera para a borda. Faltam-lhe a
+> share explícita (`s/(s+q_others)`, que é o que dá retornos decrescentes ao size) e o fator de
+> permanência na band `g(δ)` (perto da borda o drift do mid deita a perna fora e passa a marcar
+> zero). Usar a forma completa da **secção 0.5** — é a que `lpbook/optimizer.py` implementa. Duas
+> consequências que só aparecem com a forma completa: `C` escala com o size (a perda é por *fatia*
+> cheia, e os fills são **parciais** — uma fatia da perna, não a perna toda; tratá-los como fills
+> totais é o que fazia o custo explodir), e o size ótimo dimensiona-se ao **pool**, não à carteira.
+
 ### 3.2 δ\* e condição de solução interior
 
 Derivar e resolver:
@@ -195,12 +311,14 @@ mid. Em mercados com fluxo tóxico suficiente a desigualdade cumpre-se — é pr
 alvo. Se falhar (fills raros ou baratos, reward muito íngreme), o ótimo é o canto δ=0; a ferramenta
 deve provar por mercado de que lado da desigualdade está, e nunca colocar no mid por omissão.
 
-> **Corrigido (verificação repo):** o texto original mandava "bissecção ou Newton em `[0, D]`" e
-> afirmava raiz interior única. Está errado — `U'(D) > 0` sempre, logo não há bracketing em `[0, D]`
-> quando a condição se cumpre, e a raiz que a bissecção encontra no caso contrário é um mínimo.
-> Usar o algoritmo completo da **secção 0.4** (inflexão fechada `delta_m`, bracket em `[0, delta_m]`,
-> `argmax` sobre `{0, raiz, D}`, grelha como rede de segurança). A condição `C k A > 2R/D` mantém-se
-> tal como está.
+> **Corrigido, duas vezes.** (1) *Método:* "bissecção ou Newton em `[0, D]`" não funciona —
+> `U'(D) > 0` sempre, logo não há bracketing quando a condição se cumpre, e no caso contrário a raiz
+> encontrada é um **mínimo**. (2) *Tese:* a afirmação "existe δ\* > 0" **é falsa como está**. A
+> condição `C k A > 2R/D` só prova que **o mid não é o ótimo** — não prova que o ótimo seja interior:
+> pode ser a borda, e na maioria dos mercados finos é. Ver a tese dos três regimes na **secção 0.5**,
+> confirmada empiricamente. Sob o objetivo completo, esta condição fechada deixa de valer: usar o
+> teste numérico (`mid_suboptimal()` em `lpbook/optimizer.py:57`, que compara `U(ε)` com `U(0)`) e
+> depois classificar o regime com `placement_regime()`.
 
 **Nota de teoria de jogos:** a share de reward é normalizada contra concorrentes, por isso δ\* é a
 melhor resposta dado o estado competitivo observado, não um ótimo de mundo estático. A adaptação
@@ -218,10 +336,19 @@ parâmetro que diz onde parar de apertar. Método:
 3. regressão linear de `ln(lambda)` vs `delta` → declive `-k`, interceção `ln(A)`;
 4. re-estimar em janela deslizante; alimentar δ\* e a seleção de mercado.
 
-> **Nota (verificação repo):** enquanto não houver fills reais suficientes, o modo `paper` pode
-> gerar a amostra de calibração através do `ShadowFillEngine` (`xrp_bot_v9_4_1.py:820`), que já
-> caminha a profundidade real do livro com latência e slippage. É a única fonte de fills que existe
-> hoje no repo; buckets de δ com menos de N observações não devem entrar na regressão.
+> **Corrigido (implementação) — o passo 1 é onde isto falha na prática.** "Medir tempos até fill para
+> várias distâncias δ" pressupõe que existem várias distâncias. Não existem: a política converge para
+> um δ, todos os fills caem num bucket, `sxx = 0`, e a regressão não devolve nada — foi exatamente o
+> que aconteceu na corrida `paper` (secção 0.6, achado 1). **A variação de δ tem de ser imposta, não
+> esperada.** Duas fontes: (a) indexar o bucket pela distância real de *cada perna* ao mid — com o
+> skew ativo as duas pernas já estão a distâncias diferentes, e isso dá dois pontos de graça;
+> (b) dithering deliberado do δ entre requotes. O custo do dithering (algum reward perdido por não
+> estar sempre no δ ótimo corrente) é o preço de saber onde o ótimo está — e sem `k` não há regime,
+> como a secção 0.5 mostra.
+>
+> **Nota (verificação repo):** para arrancar sem fills, o `ShadowFillEngine` (`xrp_bot_v9_4_1.py:820`)
+> caminha a profundidade real do livro com latência e slippage. Buckets com menos de N observações
+> não devem entrar na regressão.
 
 ### 3.4 Skew de inventário (reservation price A-S — este uso mantém-se)
 
@@ -245,6 +372,13 @@ half-spread ótimo do A-S/GLFT **não** se usa: resolve o problema errado (fill 
 > variância. Para o termo `sigma^2` desta secção, extrair a variância total da mistura —
 > `sigma^2 * tau + lambda * tau * (mu_j^2 + sigma_j^2)` — a partir dos mesmos parâmetros, em vez de
 > chamar a função como está.
+>
+> **Corrigido (implementação):** a fórmula `r = mid − q·gamma·sigma^2·tau` aplicada com `q` em shares
+> **rebenta a escala** — deu um shift de −895c num book cujo mid vive entre 1c e 10c. O produto cru
+> não tem unidades comensuráveis com um preço em cêntimos. Normalizar ao cap de inventário e limitar:
+> `r = mid − clamp(inv/inv_cap, −1, 1) · max_skew_c`, com `max_skew_c` explícito (0.8c na
+> implementação). O sinal e a intuição do A-S mantêm-se — inventário no cap desloca exatamente
+> `max_skew_c`, nunca mais.
 
 ### 3.5 Detetor de burst (Hawkes — muda de função)
 
@@ -264,11 +398,17 @@ self-exciting paga.
 
 ## 4. Mecânica real de scoring do Polymarket (não inventar)
 
-> **Estado de verificação:** esta secção **não foi verificada** nesta sessão — `docs.polymarket.com`
-> está bloqueado pelo proxy de egress do ambiente. O conteúdo abaixo é transportado tal como veio da
-> fonte original (que o dá como confirmado em agosto de 2026). **Primeira tarefa da sessão de
-> construção: reconfirmar cada fórmula contra a doc oficial antes de escrever `scoring.py`.**
-> Toda a economia da ferramenta assenta aqui.
+> **Estado de verificação:** as **fórmulas** desta secção continuam **não verificadas** —
+> `docs.polymarket.com` está bloqueado pelo proxy de egress deste ambiente. São transportadas da
+> fonte original (que as dá como confirmadas em agosto de 2026) e estão codificadas em
+> `lpbook/scoring.py` com testes, mas os testes provam consistência interna, **não** que a fórmula
+> seja a do Polymarket. Continua a ser a primeira coisa a reconfirmar contra a doc oficial — toda a
+> economia da ferramenta assenta aqui.
+>
+> Os **nomes dos campos** do Gamma foram levantados por pesquisa web na sessão de construção e estão
+> em uso em `lpbook/data_feed.py`: `rewardsMaxSpread`, `rewardsMinSize`, `rewardsDailyRate`,
+> `clobTokenIds`, e o book em `/book?token_id=`. Não os re-verifiquei aqui (mesma rede bloqueada);
+> a primeira chamada real ao Gamma confirma-os ou desmente-os em segundos.
 
 - **Score por ordem**, dentro do `max_spread` do midpoint ajustado:
 
@@ -300,9 +440,10 @@ quadrático na distância, linear no size. Apertar bate pôr size, por larga mar
 - **Orçamentos de order/cancel** por signer, escalonados por volume maker de 30 dias. Um loop de
   requote apertado é cancel-heavy: dimensionar o loop ao tier, não descobrir o teto numa sessão volátil.
 
-**Dados:** `gamma-api.polymarket.com` para lista de mercados e metadados de reward (pool $/dia,
-`rewards_max_spread`, `rewards_min_size`); CLOB REST + WebSocket para book e midpoint ao vivo. O
-endpoint US de incentives pode exigir chave; o Gamma internacional expõe os mesmos campos de reward.
+**Dados:** `gamma-api.polymarket.com` para lista de mercados e metadados de reward
+(`rewardsDailyRate`, `rewardsMaxSpread`, `rewardsMinSize`, `clobTokenIds`); CLOB REST + WebSocket
+para book e midpoint ao vivo. O endpoint US de incentives pode exigir chave; o Gamma internacional
+expõe os mesmos campos de reward. O Gamma bloqueia User-Agents vazios — enviar um UA real.
 
 > **Nota (verificação repo):** os três endpoints já são constantes no código
 > (`xrp_bot_v9_4_1.py:206-209`) — reutilizar, não redigitar. E **não confundir** o `max_spread`
@@ -332,9 +473,22 @@ rho                   = C * Lambda_diário(delta*) / R_diário(delta*)
 - também favorecer, como sinais de baixa competição: volume 24h baixo, spread de book largo,
   profundidade moderada (muitos LPs a competir = share menor).
 
-> **Nota (verificação repo):** `E[líquido diário] <= 0` é o mesmo veredito que o solver da secção 0.4
-> devolve quando o máximo de `U` cai no canto `D` (onde `U(D) < 0` sempre). Implementar uma vez, no
-> `optimizer.py`, e o `selector.py` consome — não duplicar a conta com sinais que podem divergir.
+> **Corrigido (implementação), dois pontos:**
+>
+> 1. **O size é uma variável de decisão, não um input.** A receita está limitada pelo pool e satura
+>    na share (`s/(s+q_others)`), mas o risco de inventário cresce linearmente com o size. Meter $20
+>    — ou $5000 — num pool de $9/dia é risco puro sem receita adicional. Otimizar **conjuntamente
+>    `(size, δ)`**: `lpbook/selector.py:58-70` varre 16 sizes log-espaçados entre o `min_size` de
+>    incentivo e o teto da carteira, resolve o δ\* de cada um, e fica com o par de melhor net.
+> 2. **`rho_max` ~2–3 é frouxo demais para conta pequena.** A implementação usa **0.6** por omissão
+>    (`--rho-max`): exige que o reward esperado bata a perda adversa esperada com ~67% de folga.
+>    O raciocínio: com $20 não há margem para absorver um golpe de inventário. Os 2–3 do texto
+>    original só fazem sentido numa conta grande e tolerante a inventário — a escolha é do operador,
+>    mas o default deve ser o esquisito.
+>
+> `E[líquido diário] <= 0` é o mesmo veredito que o regime BORDA (secção 0.5, onde `U(D) < 0` por
+> construção). Implementar uma vez, no `optimizer.py`, e o `selector.py` consome — não duplicar a
+> conta com sinais que podem divergir.
 
 ---
 
@@ -382,8 +536,12 @@ gated), `replay` (snapshots históricos para validar δ\* e calibração).
 - Skew de inventário sempre ativo (secção 3.4) — nunca acumular passivamente um ativo a cair, que
   foi a falha do vídeo.
 - Kill-switch global por `control.json`; retirada de pernas em burst de fluxo (secção 3.5).
-- Size por ordem limitado; loop de requote dimensionado ao tier de order/cancel budget.
-- Nunca cotar em δ=0 salvo prova por mercado de que `C k A <= 2R/D`.
+- Size por ordem limitado; loop de requote dimensionado ao tier de order/cancel budget. *(Por fazer
+  na implementação — secção 0.6, achado 3.)*
+- Nunca cotar em δ=0 sem ter resolvido o regime desse mercado (secção 0.5). Se o resultado for MID,
+  cotar no mid — com a prova feita, ao contrário do vídeo. O que se proíbe é o mid **por omissão**.
+- Nunca correr com `k` assumido em `live`: sem calibração identificada (secção 0.6, achado 1) o
+  regime é uma adivinha, e é o regime que decide tudo.
 
 ---
 
@@ -425,9 +583,12 @@ modo. Estado em JSON atómico. Kill-switch `control.json`.
 **Critérios de aceitação:**
 
 - lê `max_spread`/`min_size`/pool por mercado do Gamma, nada hardcoded;
-- nunca coloca em δ=0 sem a prova da desigualdade;
-- o solver de δ\* passa o teste de regressão contra o varrimento em grelha, incluindo os casos de
-  canto (`delta_m <= 0` e `delta_m >= D`);
+- nunca coloca em δ=0 sem ter resolvido o regime do mercado;
+- o solver de δ\* reproduz os **três regimes** (secção 0.5) em testes parametrizados, incluindo os
+  dois cantos;
+- a calibração de A/k é **identificável**: o bucket é indexado pela distância real de cada perna e
+  há dithering de δ, de modo que uma corrida real produz ≥2 buckets povoados (secção 0.6);
+- otimiza `(size, δ)` em conjunto — o size dimensiona-se ao pool, não à carteira;
 - reporta líquido, com a seleção adversa sempre à vista;
 - trata a regra de bilateral obrigatório na banda extrema;
 - `rho` rejeita mercados tóxicos.
@@ -444,8 +605,15 @@ modo. Estado em JSON atómico. Kill-switch `control.json`.
 - Não hardcodar bankroll — parâmetro, como o `CAP` do vídeo.
 - Não ranquear mercados por pool bruta — ranquear por líquido esperado.
 - Não deixar `execution` live sem gate por flag e `control.json`.
-- **Não bissectar `dU/dδ` cegamente em `[0, D]`** (ver secção 0.4) — o bracket certo é `[0, delta_m]`
-  e o resultado tem de ser comparado com os cantos.
+- **Não bissectar `dU/dδ` cegamente em `[0, D]`** (ver secção 0.4) — a raiz encontrada assim pode ser
+  o mínimo. Com o objetivo completo, otimizar numericamente e comparar com os cantos.
+- **Não afirmar que existe sempre um δ\* interior** (secção 0.5) — e não confundir "o mid não é
+  ótimo" com "o ótimo é interior". Na maioria dos mercados finos o ótimo é a borda, que significa
+  não farmar.
+- **Não tratar os fills como totais** — são parciais, uma fatia da perna. Tratá-los como a perna
+  inteira faz o custo estimado explodir e rejeita tudo.
+- **Não dimensionar o size pela bankroll** — dimensionar pelo pool.
+- **Não aplicar o skew A-S cru com `q` em shares** — normalizar ao cap e limitar (secção 3.4).
 - **Não procurar `xrp_alpha.py`, `control.json`, painel Streamlit ou units systemd neste repo** — não
   existem (secção 0.2).
 
@@ -489,10 +657,15 @@ tem custos que não cabem aqui.
 | Bloco | Estado |
 |---|---|
 | §0 mapa do repo (existe / não existe / armadilha de nomes) | **Verificado** contra o código, com caminhos e linhas, em 29/08/2026 |
-| §0.4 correção do solver de δ\* | **Verificado analiticamente** — `U'(D) > 0` para quaisquer parâmetros, logo a receita original não bracketa |
+| §0.4 correção do solver de δ\* | **Verificado analiticamente** — `U'(D) > 0` para quaisquer parâmetros, logo a receita original não bracketa. Superado pelo objetivo completo da §0.5 |
+| §0.5 três regimes (MID / INTERIOR / BORDA) | **Verificado** — 8/8 testes de `lpbook/` passam e corri o varrimento da tabela eu próprio. `U(BORDA) < 0` é teorema |
+| §0.6 achados na implementação | **Verificado** — calibração não identificada reproduzida numa corrida `paper` real (priores intactos ao fim de 7 fills); ausência de WS/asyncio e de budget de order/cancel confirmada por leitura do código |
+| Números do `scan` a $20 (4 rejeitados, 1 armado, +$2.89/d, rho 0.52) | **Verificado** — reproduzidos localmente |
 | §3.4 âncora do jump-diffusion | **Verificado** — `xrp_alpha.py` não existe; o código está em `xrp_bot_v9_4_1.py:1637` |
 | §6 reaproveitamentos (estado, fills, endpoints, CLOB, secrets) | **Verificado** — todos existem, âncoras em §0.1 |
 | §6 `control.json`, Streamlit, systemd, TUI | **Verificado que NÃO existem** — construção nova |
-| §4 mecânica de scoring do Polymarket | **NÃO verificado** — `docs.polymarket.com` bloqueado pelo proxy de egress desta sessão. Reconfirmar antes de escrever `scoring.py` |
+| §4 fórmulas de scoring do Polymarket | **NÃO verificado** — `docs.polymarket.com` bloqueado pelo proxy de egress. Codificado em `lpbook/scoring.py`, mas os testes provam consistência interna, não conformidade com a doc |
+| §4 nomes dos campos do Gamma (`rewardsMaxSpread`…) | **Não re-verificado aqui** — levantados por pesquisa web na sessão de construção; a primeira chamada real ao Gamma confirma |
+| `scan` / `live` contra a rede real | **Nunca exercitados** — rede do Polymarket bloqueada. `paper` e `replay` correm offline |
 | §11 números de rendimento | **NÃO verificado** — transportado da fonte original |
 | §12 `secrets.txt` versionado | **Verificado** — aparece em `git ls-files`, sem `.gitignore` no repo |
