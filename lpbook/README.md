@@ -21,6 +21,9 @@ identificar), `--seed 0` (desloca as seeds do universo sintetico), `--state`,
 ## Modulos
 
 - `scoring.py`     score quadratico, Q_min nas duas bandas, midpoint ajustado, share
+- `fees.py`        taker fee real (paga no flatten); rebate de maker a 0 bps por omissao
+- `toxicity.py`    LMSR + Bayesiano -> multiplicador do custo por fill (NAO validado, off)
+- `shadow.py`      fill contra livro L2 com latencia, slippage e fills parciais
 - `optimizer.py`   delta* (share + fator de permanencia na band), regimes MID/INTERIOR/BORDA, calibracao A/k, skew A-S normalizado
 - `flow.py`        detetor de burst (Hawkes) -> alargar/retirar
 - `selector.py`    otimizacao conjunta (size, delta), E[liquido diario], rho, ranking
@@ -56,3 +59,19 @@ Detalhe e diagnostico em `../docs/PROMPT_LP_BOOK_PRO.md`, seccao 0.6.
 4. **As formulas de scoring nao estao verificadas** contra a doc do Polymarket (rede
    bloqueada no ambiente de construcao). Os testes provam consistencia interna, nao
    conformidade. Reconfirmar antes de confiar em qualquer projecao.
+5. **O sinal de toxicidade (`toxicity.py`) nao esta validado** e vem desligado
+   (`--signal-gain 0`). No harness paper o mid e um martingale e o sinal e alimentado
+   pelo proprio mid: nao pode ter edge por construcao. A/B em 3 seeds x 72h da pior
+   com ele ligado. Precisa de feed do subjacente + backtest antes de valer algo.
+6. **O rebate de maker esta a 0 bps** de proposito -- ver o aviso no topo de
+   `fees.py`. Nao foi confirmado que o Polymarket pague rebate por fill.
+
+## Porque NAO ha delta assimetrico por perna
+
+Um sinal direcional sugere apertar a perna benigna e alargar a toxica. Isso e certo
+para um market maker direcional, e errado aqui: na banda extrema o score e
+`Q_min = min(Q_bid, Q_ask)`, logo a perna PIOR fixa a pontuacao e a apertada nao
+conta. Com o gain do port original, um vies maximo retinha **1.6%** do reward (e
+zero assim que o ask sai da band). A toxicidade prevista entra por isso como
+multiplicador do custo por fill, e o `optimizer` re-resolve um delta* simetrico.
+Registado em `test_merge.py::test_delta_assimetrico_destroi_qmin`.

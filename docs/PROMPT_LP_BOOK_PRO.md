@@ -251,6 +251,70 @@ numa band de 2.0c, com o inventário no cap). Fora da band a perna marca zero e,
 perna**. Corrigido com clamp de ambas as pernas à band: o skew gasta-se do orçamento da band, não
 além dele. Coberto por teste.
 
+### 0.8 Fusão com os bots XRP do repo — o que entrou e o que foi rejeitado
+
+Uma sessão paralela portou quatro peças dos bots XRP para o `lpbook/`: fees/rebate reais, LMSR +
+sinal Bayesiano traduzidos em **δ assimétrico por perna**, shadow fill contra livro L2, e
+config/secrets. Verifiquei cada uma. Três entraram, com alterações; **a peça apresentada como a
+síntese central foi rejeitada, por aritmética.**
+
+**Rejeitado — δ assimétrico por perna.** A ideia: se o valor justo diz que o mid vai subir, um fill
+no teu ask é tóxico e no bid é benigno; logo aperta o bid e alarga o ask. Isto é **correto para um
+market maker direcional** — que é o uso original no repo, onde cada perna ganha por si. É **errado
+para LP farming**, porque na banda extrema o score é `Q_min = min(Q_bid, Q_ask)`: a perna **pior**
+fixa a pontuação, e a perna apertada não conta para nada. Medido com o `scoring.py` da própria
+ferramenta (`D = 2c`, mid 4.6c, `gain_c = 3.5` do port):
+
+| viés | d_bid | d_ask | reward retido |
+|---|---|---|---|
+| 0.10 | 0.00c | 0.35c | 68% |
+| 0.30 | 0.00c | 1.05c | 23% |
+| 0.50 | 0.00c | 1.75c | **1.6%** |
+
+A frame que a sessão apresentou como prova de funcionamento — `vies +0.50 (ask toxica) d_bid 0.00c
+d_ask 1.74c` — é o caso da última linha: **o reward a cair para 1.6%** para esquivar fills de um
+lado. Com `base δ ≥ 0.5c` e viés ≥ 0.3 o ask sai da band e o `Q_min` vai a **zero**. Sob `min()`,
+qualquer assimetria é perda pura: pagas o reward da perna larga e não recebes nada pela apertada.
+Registado em `test_delta_assimetrico_destroi_qmin`, para não voltar.
+
+**O que entrou no lugar:** a toxicidade prevista entra como **multiplicador do custo esperado por
+fill**, e o `optimizer` re-resolve o δ\* — simétrico, dentro da band, com a mesma lógica de regime.
+Mais toxicidade → custo maior → δ\* recua, ou o mercado passa a BORDA e deixa de se farmar. O sinal
+passa a informar o *preço* do risco em vez de substituir o optimizer.
+
+**Estado do sinal: NÃO VALIDADO, e desligado por omissão (`--signal-gain 0`).** No harness `paper` o
+mid é um martingale puro (`fillmodel.step_mid` com `drift = 0`) e o sinal é alimentado pelo próprio
+mid — **não pode ter poder preditivo por construção**, só se pode observar a operar. A/B em 3 seeds
+× 72 h: líquido médio $21.02 (desligado) vs $17.60 (ligado) — pior, que é o que a teoria prevê
+quando se paga por informação que não existe. Precisa de um feed do subjacente (Binance WS para
+cripto, oráculo para desporto) e de um backtest com PnL antes de valer alguma coisa.
+
+**Entrou com alteração — fees.** A `taker_fee` é real e útil: escoar inventário a mercado cruza o
+spread, e é o único ponto do farming que paga taker ($0.022 por 1000 shares a 4.6c). Ligada ao
+caminho de flatten, que antes era contabilizado como grátis. **O rebate de maker ficou a 0 bps por
+omissão**, por três razões: (a) os 20 bps vêm do default `maker_rebate_bps` do
+`xrp_true_market_maker_v5_3_1.py` — configuração de um bot, não documentação do Polymarket, e não
+verificável aqui; (b) ligá-lo faz o fill parecer parcialmente receita, que é o que a §10 proíbe;
+(c) mesmo a 20 bps vale **0.5–1.3% do movimento adverso** ($0.000092/share contra $0.012/share a
+4.6c) — não muda decisão nenhuma, só torna as projeções mais otimistas. Confirmado na doc oficial,
+passa-se `bps=20` explicitamente.
+
+**Entrou — shadow fill.** Modelo de fill contra livro L2 com latência, slippage e fills parciais.
+Nota: na entrega original **não estava ligado a lado nenhum** (zero importadores) — o modo `paper`
+continuava a usar o `try_fill` sintético. Fica como módulo testado, disponível para o modo online.
+
+**Não entrou — `config.py`.** Duplica o `_load_secrets_file()` que já existe em
+`xrp_bot_v9_4_1.py:94` e, na entrega original, também não tinha consumidor nenhum. O `LiveExecutor`
+recebe um cliente CLOB já autenticado, portanto não há o que configurar.
+
+**Nota de integração importante:** a fusão foi construída sobre a versão do `lpbook/` **anterior** às
+correções da secção 0.7 — aplicá-la tal como veio revertia o bucket por perna, o dithering e o clamp
+da band. As peças foram portadas por cima da versão corrigida, não o contrário.
+
+**Corrigido no port:** o ficheiro chamava-se `signal.py`, que **sombra o módulo `signal` da
+biblioteca padrão** — uma armadilha latente para qualquer coisa que precise de tratar sinais.
+Renomeado para `toxicity.py`.
+
 ---
 
 ## 1. Objetivo
@@ -701,6 +765,9 @@ tem custos que não cabem aqui.
 | §0.6 achados na implementação | **Verificado** — calibração não identificada reproduzida numa corrida `paper` real (priores intactos ao fim de 7 fills); ausência de WS/asyncio e de budget de order/cancel confirmada por leitura do código |
 | §0.7 correção da calibração | **Verificado** — 12/12 testes passam; `k` recuperado em 5 seeds × 72 h, erro absoluto médio 0.433 → 0.207. Amostra pequena (n=5): a direção é consistente, a amplitude ótima do dithering **não** está determinada |
 | §0.7 perna fora da band com skew | **Verificado** — reproduzido (2.4c numa band de 2.0c) e corrigido com clamp, coberto por teste |
+| §0.8 δ assimétrico destrói o `Q_min` | **Verificado** — calculado com o `scoring.py` da ferramenta: 68% / 23% / 1.6% do reward retido. É aritmética da regra `min()`, não estimativa |
+| §0.8 sinal de toxicidade | **NÃO validado** — impossível de validar no harness atual (mid é martingale). A/B em 3 seeds dá pior com o sinal ligado, como a teoria prevê. Desligado por omissão |
+| §0.8 rebate de maker (20 bps) | **NÃO verificado** — proveniência é o default de um bot deste repo, não a doc do Polymarket. A 0 bps por omissão; valeria 0.5–1.3% do adverso |
 | Números do `scan` a $20 (4 rejeitados, 1 armado, +$2.89/d, rho 0.52) | **Verificado** — reproduzidos localmente |
 | §3.4 âncora do jump-diffusion | **Verificado** — `xrp_alpha.py` não existe; o código está em `xrp_bot_v9_4_1.py:1637` |
 | §6 reaproveitamentos (estado, fills, endpoints, CLOB, secrets) | **Verificado** — todos existem, âncoras em §0.1 |
