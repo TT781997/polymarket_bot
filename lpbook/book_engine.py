@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from scoring import order_score, side_q, q_min, pool_share
 from optimizer import optimal_delta, mid_suboptimal, placement_regime, reservation_mid_c, calibrate_ak
 from flow import HawkesBurst
+from fees import flatten_cost
 
 SECS_DAY = 86400.0
 
@@ -40,7 +41,7 @@ class MarketState:
 
 class BookEngine:
     def __init__(self, st: MarketState, max_skew_c, inv_cap, hawkes: HawkesBurst,
-                 c_loss, a_fill, k_fill, dither_c: float = 0.0):
+                 c_loss, a_fill, k_fill, dither_c: float = 0.0, signal=None):
         self.st = st
         self.max_skew_c = max_skew_c
         self.inv_cap = inv_cap
@@ -49,6 +50,8 @@ class BookEngine:
         self.a_fill = a_fill
         self.k_fill = k_fill
         self.dither_c = dither_c                # amplitude do dithering de delta (c)
+        self.signal = signal                    # ToxicitySignal opcional (custo, nao skew)
+        self.cost_mult = 1.0                    # ultimo multiplicador aplicado (para a TUI)
         self._dither_phase = 0
         self._buckets: dict[float, list] = {}   # distancia ao mid -> [fills, segundos]
         self.withdrawn = False
@@ -78,8 +81,14 @@ class BookEngine:
 
     def requote(self, mid_c, q_others, sd_c, max_skew_c, now) -> None:
         pool_ps = self.st.daily_pool / SECS_DAY
+        # Toxicidade prevista entra como MULTIPLICADOR DO CUSTO e o delta* re-resolve
+        # -- simetrico. Nao como shift assimetrico das pernas: sob Q_min = min(dois
+        # lados), a perna pior fixa a pontuacao e a assimetria e perda pura (ate 98%
+        # do reward; ver signal.py e test_delta_assimetrico_destroi_qmin).
+        self.cost_mult = self.signal.cost_multiplier(mid_c / 100.0) if self.signal else 1.0
         d, _ = optimal_delta(self.st.size, self.st.max_spread_c, pool_ps, q_others,
-                             self.c_loss, self.a_fill, self.k_fill, sd_c=sd_c)
+                             self.c_loss * self.cost_mult, self.a_fill, self.k_fill,
+                             sd_c=sd_c)
         self.st.regime = placement_regime(d, self.st.max_spread_c)
         # DITHERING: cotar sempre no delta* nao identifica o k -- sem variacao
         # imposta em delta nao ha declive para estimar, e o k e quem decide o
@@ -136,6 +145,22 @@ class BookEngine:
     def mark(self, mid_c) -> float:
         """PnL nao realizado do inventario ($)."""
         return self.st.inv * (mid_c - self.st.avg_c) / 100.0
+
+    def flatten(self, mid_c) -> float:
+        """Escoa o inventario a mercado e devolve o custo realizado ($, negativo).
+
+        Escoar cruza o spread: e o unico ponto do farming que paga taker fee. Antes
+        contava-se o flatten como se fosse gratis, o que subestimava o custo de
+        bater no cap de inventario -- exatamente o evento que a ferramenta existe
+        para evitar.
+        """
+        if self.st.inv <= 0.0:
+            return 0.0
+        realizado = self.st.inv * (mid_c - self.st.avg_c) / 100.0
+        custo = flatten_cost(self.st.inv, mid_c)
+        self.st.inv = 0.0
+        self.st.avg_c = 0.0
+        return realizado - custo
 
     def inv_breach(self) -> bool:
         return self.st.inv > self.inv_cap

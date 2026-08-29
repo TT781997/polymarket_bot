@@ -17,6 +17,7 @@ from collections import deque
 
 from flow import HawkesBurst
 from fillmodel import SyntheticMarket
+from toxicity import ToxicitySignal
 from book_engine import MarketState, BookEngine, SECS_DAY
 from execution import PaperExecutor
 from selector import evaluate_market, rank_markets
@@ -81,9 +82,10 @@ def run_paper(args):
     st = MarketState(top.market_id, top.max_spread_c, top.min_size,
                      top.daily_pool, size=max(top.size, top.min_size))
     hawkes = HawkesBurst(mu=A0, alpha=0.6 * K0, beta=1.2, mult=4.0)
+    sinal = ToxicitySignal(gain=args.signal_gain) if args.signal_gain > 0 else None
     eng = BookEngine(st, MAX_SKEW_C, INV_CAP_MULT * st.size, hawkes,
                      c_loss_from(market.toxicity_c, st.size), A0, K0,
-                     dither_c=args.dither_frac * st.max_spread_c)
+                     dither_c=args.dither_frac * st.max_spread_c, signal=sinal)
     execu = PaperExecutor(market)
 
     log: deque = deque(maxlen=40)
@@ -103,6 +105,12 @@ def run_paper(args):
                 log.appendleft("[red]control.json kill=true -> stop[/]")
                 break
             market.step_mid(dt)
+            if sinal is not None:
+                # PROXY: alimentar o sinal com o proprio mid. Em paper isto NAO pode
+                # ter poder preditivo -- o mid do gerador e um martingale (drift=0),
+                # portanto o sinal so mede momentum de ruido. Em producao, ligar aqui
+                # o feed do subjacente (Binance WS para cripto, oraculo para desporto).
+                sinal.on_underlying(market.mid_c / 100.0)
             sd_c = VOL_C_PER_S * math.sqrt(REQUOTE_S)
             eng.requote(market.mid_c, q_others=market.comp, sd_c=sd_c, max_skew_c=MAX_SKEW_C, now=t)
             st.withdrawn_flag = eng.withdrawn
@@ -115,8 +123,9 @@ def run_paper(args):
                 eng.on_fill(side, sh, px, adv, t, d_fill)
                 log.appendleft(f"[red]fill[/] {side} {sh:.0f}@{px:.1f}c  adverse {adv:.1f}c  inv {st.inv:.0f}")
                 if eng.inv_breach():
-                    log.appendleft(f"[bold red]flatten[/] inv {st.inv:.0f} > cap {eng.inv_cap:.0f}")
-                    st.inv = 0.0
+                    inv_antes = st.inv
+                    pnl_realized += eng.flatten(market.mid_c)   # cruza o spread: paga taker
+                    log.appendleft(f"[bold red]flatten[/] inv {inv_antes:.0f} > cap {eng.inv_cap:.0f}")
 
             bids, asks = market.book()
             amt, q_you, share = eng.credit(market.mid_c, bids, asks, dt)
@@ -191,6 +200,10 @@ def main():
     p.add_argument("--control", default="control.json")
     p.add_argument("--seed", type=int, default=0,
                    help="desloca as seeds do universo sintetico (para repetir corridas)")
+    p.add_argument("--signal-gain", dest="signal_gain", type=float, default=0.0,
+                   help="sinal de toxicidade (LMSR+Bayesiano) como multiplicador do "
+                        "custo por fill; 0 = desligado. NAO VALIDADO: no harness "
+                        "paper o mid e um martingale, logo nao pode ter edge")
     p.add_argument("--dither-frac", dest="dither_frac", type=float, default=DITHER_FRAC,
                    help="amplitude do dithering de delta em fracao da band; 0 desliga "
                         "(e entao o k nao se identifica)")
