@@ -18,6 +18,7 @@ from collections import deque
 from flow import HawkesBurst
 from fillmodel import SyntheticMarket
 from toxicity import ToxicitySignal
+from budget import Budget, DEFAULT_ORDERS_PER_MIN, DEFAULT_CANCELS_PER_MIN
 from book_engine import MarketState, BookEngine, SECS_DAY
 from execution import PaperExecutor
 from selector import evaluate_market, rank_markets
@@ -83,9 +84,11 @@ def run_paper(args):
                      top.daily_pool, size=max(top.size, top.min_size))
     hawkes = HawkesBurst(mu=A0, alpha=0.6 * K0, beta=1.2, mult=4.0)
     sinal = ToxicitySignal(gain=args.signal_gain) if args.signal_gain > 0 else None
+    orcamento = Budget(args.orders_per_min, args.cancels_per_min)
     eng = BookEngine(st, MAX_SKEW_C, INV_CAP_MULT * st.size, hawkes,
                      c_loss_from(market.toxicity_c, st.size), A0, K0,
-                     dither_c=args.dither_frac * st.max_spread_c, signal=sinal)
+                     dither_c=args.dither_frac * st.max_spread_c, signal=sinal,
+                     budget=orcamento, min_move_c=args.min_move_c)
     execu = PaperExecutor(market)
 
     log: deque = deque(maxlen=40)
@@ -151,6 +154,8 @@ def run_paper(args):
                 "realized": round(pnl_realized, 4), "inv": st.inv,
                 "delta_c": round(st.delta_c, 3), "share": round(share, 4),
                 "rho": round(rho, 3), "fills": st.fills, "t": t,
+                "budget_ordens": orcamento.usage(t)[0],
+                "budget_travou": orcamento.denied,
             })
 
             live.update(tui.render(
@@ -164,6 +169,8 @@ def run_paper(args):
           f"liquido ${pnl_realized + eng.mark(market.mid_c):+.2f}  fills {st.fills}")
     print(f"A/k calibrados: A={eng.a_fill:.4f} k={eng.k_fill:.3f} "
           f"(priors A={A0} k={K0})")
+    print(f"orcamento: {orcamento.denied} requotes travados pelo tier "
+          f"({args.orders_per_min} ordens/min)")
 
 
 def run_scan(args):
@@ -200,6 +207,14 @@ def main():
     p.add_argument("--control", default="control.json")
     p.add_argument("--seed", type=int, default=0,
                    help="desloca as seeds do universo sintetico (para repetir corridas)")
+    p.add_argument("--orders-per-min", dest="orders_per_min", type=int,
+                   default=DEFAULT_ORDERS_PER_MIN,
+                   help="teto de ordens/min do teu tier de signer (default conservador; "
+                        "os numeros reais do Polymarket nao foram confirmaveis)")
+    p.add_argument("--cancels-per-min", dest="cancels_per_min", type=int,
+                   default=DEFAULT_CANCELS_PER_MIN, help="teto de cancelamentos/min")
+    p.add_argument("--min-move-c", dest="min_move_c", type=float, default=0.1,
+                   help="movimento minimo (c) para valer a pena cancelar e repor")
     p.add_argument("--signal-gain", dest="signal_gain", type=float, default=0.0,
                    help="sinal de toxicidade (LMSR+Bayesiano) como multiplicador do "
                         "custo por fill; 0 = desligado. NAO VALIDADO: no harness "

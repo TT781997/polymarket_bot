@@ -139,6 +139,57 @@ def test_skew_nao_empurra_perna_para_fora_da_band():
     print("ok  skew nunca empurra uma perna para fora da band")
 
 
+def _engine(**kw):
+    from book_engine import BookEngine, MarketState
+    from flow import HawkesBurst
+    st = MarketState("T", max_spread_c=2.0, min_size=40, daily_pool=480.0, size=200)
+    eng = BookEngine(st, max_skew_c=0.8, inv_cap=600,
+                     hawkes=HawkesBurst(0.01, 0.006, 1.2, 4.0),
+                     c_loss=1.8, a_fill=0.02, k_fill=6.0, **kw)
+    return st, eng
+
+
+def test_budget_janela_deslizante():
+    from budget import Budget
+    b = Budget(orders_per_min=4, cancels_per_min=4)
+    assert b.can_afford(0.0)
+    b.spend(0.0)                       # 2 ordens + 2 cancelamentos
+    assert b.can_afford(1.0)
+    b.spend(1.0)
+    assert not b.can_afford(2.0)       # cheio
+    assert b.can_afford(61.5)          # a janela ja deixou cair o primeiro par
+    print("ok  budget usa janela deslizante (nao um contador que reinicia)")
+
+
+def test_budget_trava_requote_sem_perder_pernas():
+    # Sem orcamento, o certo e MANTER as pernas antigas: ficar de pe pontua, ficar
+    # sem pernas nao. O contrario -- cancelar e nao conseguir repor -- e o pior caso.
+    from budget import Budget
+    b = Budget(orders_per_min=2, cancels_per_min=2)
+    st, eng = _engine(budget=b, dither_c=0.6)
+    eng.requote(mid_c=5.0, q_others=3000, sd_c=0.6, max_skew_c=0.8, now=0.0)
+    bid0, ask0 = st.bid.level_c, st.ask.level_c
+    assert st.bid is not None
+    eng.requote(mid_c=5.9, q_others=3000, sd_c=0.6, max_skew_c=0.8, now=1.0)
+    assert b.denied == 1
+    assert st.bid is not None and st.ask is not None      # nunca fica sem pernas
+    assert (st.bid.level_c, st.ask.level_c) == (bid0, ask0)
+    print("ok  budget trava o requote e mantem as pernas de pe")
+
+
+def test_requote_ignora_movimento_abaixo_do_tick():
+    from budget import Budget
+    b = Budget(orders_per_min=100, cancels_per_min=100)
+    st, eng = _engine(budget=b, dither_c=0.0, min_move_c=0.1)
+    eng.requote(mid_c=5.0, q_others=3000, sd_c=0.6, max_skew_c=0.8, now=0.0)
+    gastas, _ = b.usage(0.0)
+    eng.requote(mid_c=5.01, q_others=3000, sd_c=0.6, max_skew_c=0.8, now=1.0)
+    assert b.usage(1.0)[0] == gastas, "movimento de 0.01c nao devia gastar orcamento"
+    eng.requote(mid_c=5.6, q_others=3000, sd_c=0.6, max_skew_c=0.8, now=2.0)
+    assert b.usage(2.0)[0] > gastas, "movimento de 0.6c devia repor as pernas"
+    print("ok  requote ignora movimento abaixo do tick (nao gasta orcamento em churn)")
+
+
 def test_skew_normalized_and_clamped():
     # inventario no cap -> shift = max_skew_c; nunca explode
     r_cap = reservation_mid_c(5.0, inv=600, inv_cap=600, max_skew_c=0.8)
@@ -164,5 +215,8 @@ if __name__ == "__main__":
     test_calibration_recusa_nao_identificavel()
     test_buckets_por_perna_dao_declive()
     test_skew_nao_empurra_perna_para_fora_da_band()
+    test_budget_janela_deslizante()
+    test_budget_trava_requote_sem_perder_pernas()
+    test_requote_ignora_movimento_abaixo_do_tick()
     test_skew_normalized_and_clamped()
     print("\nTODOS OS TESTES PASSARAM")

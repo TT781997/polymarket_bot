@@ -18,7 +18,7 @@ class PaperExecutor:
     def place(self, bid, ask) -> None:
         pass
 
-    def poll_fills(self, st, dt):
+    def poll_fills(self, st, dt, mid_c=None, now=None):
         """Devolve [(side, shares, level_c, adverse_c, delta_c), ...].
 
         `delta_c` e a distancia da perna ao mid ANTES do fill -- e a distancia que
@@ -43,11 +43,13 @@ class LiveExecutor:
     """Coloca ordens reais no CLOB. Reutiliza um cliente py-clob-client ja
     autenticado (mesma infra dos bots XRP). Requer arm() explicito."""
 
-    def __init__(self, clob_client, token_id_bid, token_id_ask, control_path):
+    def __init__(self, clob_client, token_id_bid, token_id_ask, control_path,
+                 router=None):
         self.clob = clob_client
         self.token_bid = token_id_bid    # token do lado onde poe o bid
         self.token_ask = token_id_ask    # complementar (ask = bid no outro token)
         self.control_path = control_path
+        self.router = router             # FillRouter alimentado pelo WS de user
         self.armed = False
         self._live_ids: dict[str, str] = {}
 
@@ -80,9 +82,15 @@ class LiveExecutor:
             raise RuntimeError("control.json kill=true: pernas retiradas")
         self.cancel_all()
         if bid:
-            self._live_ids["bid"] = self._post(self.token_bid, "bid", bid.level_c, bid.size)
+            oid = self._post(self.token_bid, "bid", bid.level_c, bid.size)
+            self._live_ids["bid"] = oid
+            if self.router and oid:
+                self.router.register_leg(oid, "bid", bid.level_c)
         if ask:
-            self._live_ids["ask"] = self._post(self.token_ask, "bid", 100.0 - ask.level_c, ask.size)
+            oid = self._post(self.token_ask, "bid", 100.0 - ask.level_c, ask.size)
+            self._live_ids["ask"] = oid
+            if self.router and oid:
+                self.router.register_leg(oid, "ask", ask.level_c)
 
     def cancel_all(self) -> None:
         for oid in filter(None, self._live_ids.values()):
@@ -90,11 +98,19 @@ class LiveExecutor:
                 self.clob.cancel(oid)
             except Exception:
                 pass
+            if self.router:
+                self.router.forget_leg(oid)
         self._live_ids.clear()
 
-    def poll_fills(self, st, dt):
-        # em live, os fills chegam pelo WS de user; ligar ao mesmo listener dos
-        # bots XRP e encaminhar para BookEngine.on_fill. Sem WS, nao inventa fills.
-        # Mesmo contrato do PaperExecutor: (side, shares, level_c, adverse_c,
-        # delta_c), com delta_c medido contra o mid do momento do fill.
-        return []
+    def poll_fills(self, st, dt, mid_c=None, now=None):
+        """Mesmo contrato do PaperExecutor: (side, shares, level_c, adverse_c, delta_c).
+
+        As mensagens do WS de user entram pelo `router.on_message()` -- ligar o
+        listener ao padrao de `xrp_bot_v9_4_1.py:2920` (auth L2, PING/PONG a 4s,
+        reconexao com backoff) e encaminhar para ca. Aqui so se liquidam os fills
+        cujo horizonte de medicao do adverso ja passou: no instante do fill o
+        movimento adverso ainda nao existe. Sem router, nao inventa fills.
+        """
+        if self.router is None or mid_c is None or now is None:
+            return []
+        return self.router.settle(mid_c, now)

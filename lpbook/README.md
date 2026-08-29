@@ -15,8 +15,12 @@ de mercado por liquido esperado com guardrail rho.
 Flags: `--rho-max 0.6`, `--pool-threshold 1.0`, `--hours 24`, `--speed 0.04`
 (sleep por passo na TUI; 0 = tao rapido quanto possivel), `--dither-frac 0.30`
 (amplitude do dithering de delta em fracao da band; 0 desliga e o k deixa de se
-identificar), `--seed 0` (desloca as seeds do universo sintetico), `--state`,
-`--control`.
+identificar), `--seed 0` (desloca as seeds do universo sintetico),
+`--orders-per-min 30` / `--cancels-per-min 30` (o teu tier de signer),
+`--min-move-c 0.1`, `--signal-gain 0` (sinal de toxicidade, nao validado),
+`--state`, `--control`.
+
+    python test_core.py && python test_merge.py && python test_live.py
 
 ## Modulos
 
@@ -24,6 +28,8 @@ identificar), `--seed 0` (desloca as seeds do universo sintetico), `--state`,
 - `fees.py`        taker fee real (paga no flatten); rebate de maker a 0 bps por omissao
 - `toxicity.py`    LMSR + Bayesiano -> multiplicador do custo por fill (NAO validado, off)
 - `shadow.py`      fill contra livro L2 com latencia, slippage e fills parciais
+- `budget.py`      orcamento de ordens/cancelamentos por tier (janela deslizante)
+- `live_fills.py`  fills do WS de user + medicao do adverso depois do horizonte
 - `optimizer.py`   delta* (share + fator de permanencia na band), regimes MID/INTERIOR/BORDA, calibracao A/k, skew A-S normalizado
 - `flow.py`        detetor de burst (Hawkes) -> alargar/retirar
 - `selector.py`    otimizacao conjunta (size, delta), E[liquido diario], rho, ranking
@@ -51,11 +57,15 @@ Detalhe e diagnostico em `../docs/PROMPT_LP_BOOK_PRO.md`, seccao 0.6.
    informacao. Detalhe em `../docs/PROMPT_LP_BOOK_PRO.md`, seccao 0.7. Fica em aberto:
    a amplitude do dithering (`--dither-frac`, default 0.30) **nao esta otimizada** --
    0.15 e 0.30 sao indistinguiveis com n=5 e querem um varrimento a serio.
-2. **Sem WebSocket e sem asyncio.** `data_feed.py` e REST sincrono. Em `live`,
-   `LiveExecutor.poll_fills()` devolve `[]`: sem o WS de user ligado, inventario,
-   skew e calibracao nao recebem fills nenhuns.
-3. **Sem contabilidade de order/cancel budget.** `LiveExecutor.place()` cancela e
-   repoe a cada requote, sem contar contra o tier do signer.
+2. **Falta so o TRANSPORTE do WS de user.** A logica de fills reais esta feita e
+   testada (`live_fills.py`, `test_live.py`): o `FillRouter` traduz as mensagens e
+   mede o adverso depois de um horizonte. O que falta e ligar o listener WS ao
+   padrao de `xrp_bot_v9_4_1.py:2920` e encaminhar para `router.on_message()`.
+   `data_feed.py` continua REST sincrono (sem asyncio).
+3. ~~Sem contabilidade de order/cancel budget.~~ **Corrigido** (`budget.py`): janela
+   deslizante, requote que cede o lugar quando nao ha tier, e dithering que cede ao
+   orcamento. Os limites reais por tier do Polymarket NAO foram confirmaveis -- o
+   default e conservador (30/min); passa os teus em `--orders-per-min`.
 4. **As formulas de scoring nao estao verificadas** contra a doc do Polymarket (rede
    bloqueada no ambiente de construcao). Os testes provam consistencia interna, nao
    conformidade. Reconfirmar antes de confiar em qualquer projecao.
