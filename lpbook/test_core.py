@@ -84,6 +84,61 @@ def test_calibration_recovers_ak():
     print(f"ok  calibracao recupera A={A_hat:.4f} (v {A_true}) k={k_hat:.3f} (v {k_true})")
 
 
+def test_calibration_usa_buckets_vazios():
+    # Um bucket com exposicao e ZERO fills e informacao sobre o k. A regressao
+    # ln(lambda) tinha de o descartar (ln 0); o MLE de Poisson usa-o.
+    povoados = [(0.2, 40, 5000.0), (0.8, 6, 5000.0)]
+    _, k_sem = calibrate_ak(povoados)
+    _, k_com = calibrate_ak(povoados + [(1.6, 0, 5000.0)])
+    assert k_com >= k_sem, f"o bucket vazio devia apertar o k: {k_com} < {k_sem}"
+    print(f"ok  bucket vazio entra na estimativa (k {k_sem:.3f} -> {k_com:.3f})")
+
+
+def test_calibration_recusa_nao_identificavel():
+    # (a) uma so distancia: sem declive, por muitos fills que haja
+    assert calibrate_ak([(0.4, 500, 9000.0)]) is None
+    # (b) fills todos na menor distancia exposta: o MLE foge para k_max, o que e
+    #     ausencia de informacao. Melhor devolver None e ficar nos priores.
+    assert calibrate_ak([(0.2, 40, 5000.0), (1.4, 0, 5000.0)]) is None
+    # (c) poucos fills: nao se vira um regime com 2 observacoes
+    assert calibrate_ak([(0.2, 2, 500.0), (0.9, 1, 500.0)], min_fills=5) is None
+    print("ok  calibracao recusa historicos nao identificaveis (1 delta / fronteira / poucos fills)")
+
+
+def test_buckets_por_perna_dao_declive():
+    # O bug: indexar as duas pernas pelo delta simetrico colapsa tudo num bucket
+    # e a calibracao nunca identifica o k. Com o skew as pernas estao a distancias
+    # diferentes do mid verdadeiro -- tem de gerar dois buckets.
+    from book_engine import BookEngine, MarketState
+    from flow import HawkesBurst
+    st = MarketState("T", max_spread_c=2.0, min_size=40, daily_pool=480.0, size=200)
+    eng = BookEngine(st, max_skew_c=0.8, inv_cap=600, hawkes=HawkesBurst(0.01, 0.006, 1.2, 4.0),
+                     c_loss=1.8, a_fill=0.02, k_fill=6.0)      # regime INTERIOR
+    st.inv = 300                                   # metade do cap -> skew de 0.4c
+    eng.requote(mid_c=5.0, q_others=3000, sd_c=0.6, max_skew_c=0.8, now=0.0)
+    eng.observe_time(60.0, mid_c=5.0)
+    chaves = sorted(eng._buckets)
+    assert len(chaves) == 2, f"esperava duas distancias distintas, veio {chaves}"
+    assert abs((chaves[1] - chaves[0]) - 0.8) < 0.11   # 2 * skew de 0.4c
+    print(f"ok  buckets por perna dao dois deltas distintos {chaves} (era um so)")
+
+
+def test_skew_nao_empurra_perna_para_fora_da_band():
+    # Com delta* na borda e inventario no cap, o skew cru poe uma perna fora da
+    # band -- e na banda extrema Q_min = min(...) = 0, logo o par deixa de pontuar.
+    from book_engine import BookEngine, MarketState
+    from flow import HawkesBurst
+    st = MarketState("T", max_spread_c=2.0, min_size=40, daily_pool=12.0, size=200)
+    eng = BookEngine(st, max_skew_c=0.8, inv_cap=600, hawkes=HawkesBurst(0.01, 0.006, 1.2, 4.0),
+                     c_loss=0.05, a_fill=0.02, k_fill=1.0)      # regime BORDA
+    st.inv = 600                                                # inventario no cap
+    eng.requote(mid_c=5.0, q_others=3000, sd_c=0.6, max_skew_c=0.8, now=0.0)
+    for leg in (st.bid, st.ask):
+        assert abs(leg.level_c - 5.0) <= st.max_spread_c + 1e-9, \
+            f"perna {leg.side} a {abs(leg.level_c - 5.0):.2f}c, fora da band de {st.max_spread_c}c"
+    print("ok  skew nunca empurra uma perna para fora da band")
+
+
 def test_skew_normalized_and_clamped():
     # inventario no cap -> shift = max_skew_c; nunca explode
     r_cap = reservation_mid_c(5.0, inv=600, inv_cap=600, max_skew_c=0.8)
@@ -105,5 +160,9 @@ if __name__ == "__main__":
     test_three_regimes()
     test_mid_suboptimal_flags_backoff()
     test_calibration_recovers_ak()
+    test_calibration_usa_buckets_vazios()
+    test_calibration_recusa_nao_identificavel()
+    test_buckets_por_perna_dao_declive()
+    test_skew_nao_empurra_perna_para_fora_da_band()
     test_skew_normalized_and_clamped()
     print("\nTODOS OS TESTES PASSARAM")

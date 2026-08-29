@@ -31,6 +31,7 @@ INV_CAP_MULT = 3.0           # cap de inventario = mult * size da perna
 MAX_SKEW_C = 0.8             # shift maximo do skew A-S (c) com inv no cap
 VOL_C_PER_S = 0.03           # vol do mid (c/sqrt(s)) para o drift/sd
 REQUOTE_S = 60.0             # intervalo de requote (s)
+DITHER_FRAC = 0.30           # amplitude do dithering de delta, em fracao da band
 GAMMA = 0.0                  # placeholder removido abaixo
 
 
@@ -43,11 +44,11 @@ def run_paper(args):
     console_sleep = args.speed
     # universo sintetico (substitui o scan real de ~3255 mercados)
     universe = [
-        SyntheticMarket("MLB-SD-COL-F5", 4.6, 2.0, 100, 21.60, A0, K0, toxicity_c=1.2, comp=1800, seed=7),
-        SyntheticMarket("NHL-VGK-EDM-P2", 6.0, 2.0, 100, 0.60, A0, K0, toxicity_c=1.0, comp=900, seed=8),
-        SyntheticMarket("NBA-DEN-MIN-U8", 3.2, 2.0, 100, 0.85, A0, K0, toxicity_c=1.4, comp=1400, seed=9),
-        SyntheticMarket("EPL-BHA-EVE-BTS", 5.0, 3.0, 50, 6.40, A0, K0, toxicity_c=2.6, comp=2200, seed=10),
-        SyntheticMarket("TEN-QUAL-R1-S1", 5.0, 2.0, 40, 12.00, A0, K0, toxicity_c=0.3, comp=200, seed=11),
+        SyntheticMarket("MLB-SD-COL-F5", 4.6, 2.0, 100, 21.60, A0, K0, toxicity_c=1.2, comp=1800, seed=7+args.seed),
+        SyntheticMarket("NHL-VGK-EDM-P2", 6.0, 2.0, 100, 0.60, A0, K0, toxicity_c=1.0, comp=900, seed=8+args.seed),
+        SyntheticMarket("NBA-DEN-MIN-U8", 3.2, 2.0, 100, 0.85, A0, K0, toxicity_c=1.4, comp=1400, seed=9+args.seed),
+        SyntheticMarket("EPL-BHA-EVE-BTS", 5.0, 3.0, 50, 6.40, A0, K0, toxicity_c=2.6, comp=2200, seed=10+args.seed),
+        SyntheticMarket("TEN-QUAL-R1-S1", 5.0, 2.0, 40, 12.00, A0, K0, toxicity_c=0.3, comp=200, seed=11+args.seed),
     ]
 
     # seleccao: avalia cada mercado no seu delta*, aplica rho e feasibilidade
@@ -81,7 +82,8 @@ def run_paper(args):
                      top.daily_pool, size=max(top.size, top.min_size))
     hawkes = HawkesBurst(mu=A0, alpha=0.6 * K0, beta=1.2, mult=4.0)
     eng = BookEngine(st, MAX_SKEW_C, INV_CAP_MULT * st.size, hawkes,
-                     c_loss_from(market.toxicity_c, st.size), A0, K0)
+                     c_loss_from(market.toxicity_c, st.size), A0, K0,
+                     dither_c=args.dither_frac * st.max_spread_c)
     execu = PaperExecutor(market)
 
     log: deque = deque(maxlen=40)
@@ -101,13 +103,16 @@ def run_paper(args):
                 log.appendleft("[red]control.json kill=true -> stop[/]")
                 break
             market.step_mid(dt)
-            eng.observe_time(dt)
             sd_c = VOL_C_PER_S * math.sqrt(REQUOTE_S)
             eng.requote(market.mid_c, q_others=market.comp, sd_c=sd_c, max_skew_c=MAX_SKEW_C, now=t)
             st.withdrawn_flag = eng.withdrawn
+            # exposicao contada DEPOIS do requote: e nestas pernas, a estas
+            # distancias, que os fills deste passo vao ser gerados. Contar antes
+            # atribuia o tempo as pernas antigas e os fills as novas.
+            eng.observe_time(dt, market.mid_c)
 
-            for side, sh, px, adv in execu.poll_fills(st, dt):
-                eng.on_fill(side, sh, px, adv, t)
+            for side, sh, px, adv, d_fill in execu.poll_fills(st, dt):
+                eng.on_fill(side, sh, px, adv, t, d_fill)
                 log.appendleft(f"[red]fill[/] {side} {sh:.0f}@{px:.1f}c  adverse {adv:.1f}c  inv {st.inv:.0f}")
                 if eng.inv_breach():
                     log.appendleft(f"[bold red]flatten[/] inv {st.inv:.0f} > cap {eng.inv_cap:.0f}")
@@ -184,6 +189,11 @@ def main():
     p.add_argument("--speed", type=float, default=0.04, help="sleep por passo na TUI (s)")
     p.add_argument("--state", default="lp_state.json")
     p.add_argument("--control", default="control.json")
+    p.add_argument("--seed", type=int, default=0,
+                   help="desloca as seeds do universo sintetico (para repetir corridas)")
+    p.add_argument("--dither-frac", dest="dither_frac", type=float, default=DITHER_FRAC,
+                   help="amplitude do dithering de delta em fracao da band; 0 desliga "
+                        "(e entao o k nao se identifica)")
     p.add_argument("--live-confirm", dest="live_confirm", action="store_true")
     args = p.parse_args()
 
