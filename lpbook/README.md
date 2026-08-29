@@ -13,7 +13,10 @@ de mercado por liquido esperado com guardrail rho.
     python test_core.py                                     # testes das partes puras
 
 Flags: `--rho-max 0.6`, `--pool-threshold 1.0`, `--hours 24`, `--speed 0.04`
-(sleep por passo na TUI; 0 = tao rapido quanto possivel), `--state`, `--control`.
+(sleep por passo na TUI; 0 = tao rapido quanto possivel), `--dither-frac 0.30`
+(amplitude do dithering de delta em fracao da band; 0 desliga e o k deixa de se
+identificar), `--seed 0` (desloca as seeds do universo sintetico), `--state`,
+`--control`.
 
 ## Modulos
 
@@ -39,13 +42,12 @@ em vez de fingir. Os modos scan/live precisam da rede do Polymarket (Gamma/CLOB)
 
 Detalhe e diagnostico em `../docs/PROMPT_LP_BOOK_PRO.md`, seccao 0.6.
 
-1. **A calibracao A/k nao arranca sozinha.** O bucket e indexado pelo delta corrente
-   (`book_engine.py:56,81`); como a politica converge para um delta, todos os fills
-   caem num bucket, a regressao fica sem variacao em x e devolve `None` -- a
-   ferramenta corre nos priores `A0/K0` para sempre. Correcoes: indexar pela
-   distancia real de cada perna ao mid (as duas pernas ja divergem com o skew) e
-   fazer dithering deliberado do delta. Como e o `k` que decide o regime, correr com
-   `k` assumido e o mesmo erro do video, so que documentado.
+1. ~~A calibracao A/k nao arranca sozinha.~~ **Corrigido** (bucket por perna + MLE de
+   Poisson que usa os buckets vazios + dithering de delta). Erro absoluto medio do `k`
+   em 5 seeds x 72h: 0.433 -> 0.207, ao custo de ~8.7% do liquido -- o preco da
+   informacao. Detalhe em `../docs/PROMPT_LP_BOOK_PRO.md`, seccao 0.7. Fica em aberto:
+   a amplitude do dithering (`--dither-frac`, default 0.30) **nao esta otimizada** --
+   0.15 e 0.30 sao indistinguiveis com n=5 e querem um varrimento a serio.
 2. **Sem WebSocket e sem asyncio.** `data_feed.py` e REST sincrono. Em `live`,
    `LiveExecutor.poll_fills()` devolve `[]`: sem o WS de user ligado, inventario,
    skew e calibracao nao recebem fills nenhuns.

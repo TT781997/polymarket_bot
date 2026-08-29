@@ -101,24 +101,66 @@ def optimal_delta(size, max_spread_c, pool_ps, q_others, c_loss, a_fill, k_fill,
     return x, utility(x, *args)
 
 
-def calibrate_ak(buckets: list[tuple[float, int, float]]) -> tuple[float, float] | None:
-    """Regressao ln(lambda) vs delta. `buckets`: [(delta_c, fills, seconds), ...]."""
-    xs, ys = [], []
-    for dc, f, s in buckets:
-        if s > 0.0 and f > 0:
-            xs.append(dc)
-            ys.append(math.log(f / s))
-    n = len(xs)
-    if n < 2:
+def calibrate_ak(buckets: list[tuple[float, int, float]], min_fills: int = 5,
+                 k_max: float = 20.0, min_span_c: float = 0.3) -> tuple[float, float] | None:
+    """MLE de Poisson para lambda(d) = A*exp(-k*d). `buckets`: [(delta_c, fills, segundos)].
+
+    Porque nao a regressao ln(lambda) vs delta: essa precisa de ln(f/s) e por isso
+    tem de descartar os buckets com zero fills -- mas "zero fills em 3000s a 1.4c"
+    e precisamente a observacao que fixa o k. Descarta-los deixa so os buckets que
+    tiveram sorte e enviesa o k para baixo, ou nao identifica nada de todo.
+
+    Aqui entra todo o bucket com exposicao. Para k fixo, A tem forma fechada
+    (A = fills_totais / sum(s_i * exp(-k d_i))), sobrando uma procura 1D em k.
+    """
+    pts = [(d, f, s) for d, f, s in buckets if s > 0.0]
+    total_fills = sum(f for _, f, _ in pts)
+    # exige exposicao em pelo menos dois deltas distintos: com uma so distancia
+    # nao ha declive para identificar, por muitos fills que haja.
+    if total_fills < min_fills or len({round(d, 6) for d, _, _ in pts}) < 2:
         return None
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx == 0.0:
+    # e preciso amplitude, nao so dois pontos: estimar um decaimento numa janela
+    # de 0.1c e extrapola-lo para uma band de 2c e adivinhar com aritmetica.
+    if max(d for d, _, _ in pts) - min(d for d, _, _ in pts) < min_span_c:
         return None
-    sxy = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
-    slope = sxy / sxx
-    return math.exp(my - slope * mx), -slope
+    sum_fd = sum(f * d for d, f, _ in pts)
+
+    def _neg_loglik(k: float) -> float:
+        den = sum(s * math.exp(-k * d) for d, _, s in pts)
+        if den <= 0.0:
+            return float("inf")
+        a = total_fills / den
+        # no otimo em A o termo -sum(s*A*exp(-k d)) colapsa em -total_fills
+        return -(total_fills * math.log(a) - k * sum_fd - total_fills)
+
+    grid = 200
+    best_k, best_v = 0.0, _neg_loglik(0.0)
+    for i in range(1, grid + 1):
+        k = k_max * i / grid
+        v = _neg_loglik(k)
+        if v < best_v:
+            best_v, best_k = v, k
+    step = k_max / grid
+    lo, hi = max(0.0, best_k - step), min(k_max, best_k + step)
+    r = 0.6180339887
+    while hi - lo > 1e-7 * k_max:
+        m1 = hi - r * (hi - lo)
+        m2 = lo + r * (hi - lo)
+        if _neg_loglik(m1) > _neg_loglik(m2):
+            lo = m1
+        else:
+            hi = m2
+    k_hat = 0.5 * (lo + hi)
+    # A condicao do MLE e "distancia media observada dos fills == a prevista pelo
+    # modelo". Se todos os fills cairam na menor distancia exposta, nada limita o k
+    # por cima e o otimo foge para k_max: e ausencia de informacao, nao um k enorme.
+    # Devolver None e correr nos priores e mais honesto do que fingir um decaimento.
+    if k_hat >= 0.999 * k_max:
+        return None
+    den = sum(s * math.exp(-k_hat * d) for d, _, s in pts)
+    if den <= 0.0:
+        return None
+    return total_fills / den, k_hat
 
 
 def reservation_mid_c(mid_c, inv, inv_cap, max_skew_c) -> float:

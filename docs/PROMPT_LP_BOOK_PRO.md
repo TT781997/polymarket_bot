@@ -181,21 +181,12 @@ a $20 de bankroll o scan rejeita 4 dos 5 mercados sintéticos e arma o qualifier
 competição (pool $12/dia, δ\* MID, net +$2.89/dia, `rho` 0.52). Três achados que não estavam
 assinalados:
 
-1. **A calibração de `k` não arranca sozinha — problema de identificação.** No fim de uma corrida
-   `paper` de 2 h com 7 fills, o output foi `A/k calibrados: A=0.0004 k=0.900 (priors A=0.0004
-   k=0.9)`: os priores intactos. A causa está em `book_engine.py:56` e `:81` — o bucket é indexado
-   por `round(self.st.delta_c, 1)`, o δ **corrente**. Como a política converge para um único δ, todos
-   os fills caem num só bucket, a regressão fica com `sxx = 0` e `calibrate_ak` devolve `None` para
-   sempre. **Não se pode estimar o declive de `λ(δ)` a partir de fills recolhidos todos ao mesmo δ.**
-   Pior: as duas pernas ficam em `r ± d` à volta do mid **enviesado** (`book_engine.py:75-76`), ou
-   seja a distâncias diferentes do mid verdadeiro — e o executor até usa essa distância assimétrica
-   para gerar o fill (`execution.py:25,30`) — mas o bucket deita a assimetria fora ao indexar pelo
-   `d` simétrico. Duas correções, por ordem de retorno: (a) indexar o bucket pela distância real
-   **de cada perna** ao mid, o que já dá dois pontos de regressão de graça; (b) dithering deliberado
-   do δ entre requotes (as "sondas controladas" da secção 3.3), porque sem variação imposta não há
-   informação para identificar `k`. Enquanto isto não estiver feito, a ferramenta corre nos priores
-   — e como a secção 0.5 mostra que é o `k` que decide o regime, correr com um `k` assumido é
-   estruturalmente o mesmo erro do vídeo, só que mais bem documentado.
+1. **A calibração de `k` não arrancava — problema de identificação. ✅ CORRIGIDO** (ver 0.7 para o
+   que foi preciso e o que custou). O diagnóstico: o bucket era indexado por
+   `round(self.st.delta_c, 1)`, o δ **corrente**. Como a política converge para um único δ, todos os
+   fills caíam num só bucket, a regressão ficava com `sxx = 0` e `calibrate_ak` devolvia `None` para
+   sempre — numa corrida `paper` de 2 h com 7 fills os priores saíram intactos. **Não se estima o
+   declive de `λ(δ)` com fills recolhidos todos ao mesmo δ.**
 2. **Sem WebSocket e sem asyncio.** `data_feed.py` é REST síncrono (`httpx`), tanto para o Gamma
    como para o book (`/book?token_id=`). A secção 6 pede CLOB WS para book/mid ao vivo, e o resto do
    repo é todo asyncio. Com polling REST, o uptime — que a secção 4 diz pontuar diretamente — fica
@@ -209,6 +200,56 @@ assinalados:
 
 Nota de dependências: `lpbook/` traz `httpx` e `rich`, nenhuma delas usada pelos bots XRP (que usam
 `requests` e `websockets`). Ver `lpbook/README.md`.
+
+### 0.7 Correção da calibração — o que foi preciso, e o que custou
+
+O achado 1 está corrigido. **A correção que eu próprio recomendei como suficiente não era.**
+Registo a sequência porque o erro é instrutivo:
+
+**Passo 1 — indexar o bucket por perna** (`book_engine.py`, `observe_time`/`on_fill`, com o executor
+a devolver a distância que gerou o fill). Resultado: a calibração passou a *correr* — mas devolveu
+`k = 0.000` contra um `k` verdadeiro de 0.9. Porquê: no regime MID (`δ* = 0`) as duas pernas ficam
+ambas à distância do skew, ou seja **na mesma distância**; a única variação em δ vinha da deriva do
+inventário, uma janela estreita e endógena. O mecanismo destrancou; a identificação não.
+
+**Passo 2 — estimador que usa os buckets vazios.** A regressão `ln(λ)` vs δ precisa de `ln(f/s)` e
+por isso descarta todo o bucket com zero fills — mas *"zero fills em 5000 s a 1.4c"* é precisamente
+a observação que fixa o `k`. Descartá-los deixa só os buckets com sorte e enviesa o `k` para baixo.
+Substituído por MLE de Poisson (`λ(d) = A·e^(−kd)`, `A` em forma fechada dado `k`, procura 1-D em
+`k`), que usa toda a exposição. Dois guardas de honestidade: se o ótimo foge para `k_max`, é porque
+todos os fills caíram na menor distância exposta — ausência de informação, não decaimento infinito;
+devolve `None`. E exige amplitude mínima entre distâncias (`min_span_c`): estimar um decaimento numa
+janela de 0.1c e extrapolá-lo para uma band de 2c é adivinhar com aritmética.
+
+**Passo 3 — dithering de δ.** Sem variação imposta não há declive. Ciclo simétrico de 4 fases à volta
+do δ\* (`--dither-frac`, default 0.30 da band); o regime continua a ser classificado no δ\*
+verdadeiro, não no dithered.
+
+Medição, 5 seeds × 72 h simuladas, `k` verdadeiro = 0.9:
+
+| seed | sem dithering | com dithering (0.30) |
+|---|---|---|
+| 0 | 0.578 | 1.227 |
+| 100 | **0.000** | 0.868 |
+| 200 | 1.435 | 0.877 |
+| 300 | 0.900 | 1.411 |
+| 400 | 0.492 | 1.040 |
+| **erro absoluto médio** | **0.433** | **0.207** |
+| **líquido médio** | **$24.60** | **$22.46** |
+
+Leitura honesta, com n=5: o erro médio cai para metade, mas **3 dos 5 seeds melhoram e 2 pioram
+ligeiramente** — a média cai sobretudo por eliminar o falhanço total (o `k = 0.000` do seed 100, que
+teria mandado o regime para o sítio errado com confiança). O dithering custou **8.7% do líquido**
+nesta configuração: é o preço explícito da informação, e é a troca certa quando é o `k` que decide o
+regime. Amplitudes de 0.15 e 0.30 são indistinguíveis nestes dados (erro médio 0.213 vs 0.207) — o
+valor exato quer um varrimento a sério antes de ser afinado; o default de 0.30 não está otimizado.
+
+**Achado adicional, encontrado pelo teste da correção:** com o skew ativo, as pernas ficavam em
+`r ± d` à volta do mid enviesado e a perna do lado contrário ao inventário **saía da band** (2.4c
+numa band de 2.0c, com o inventário no cap). Fora da band a perna marca zero e, na banda extrema
+(mid < 10c), `Q_min = min(dois lados) = 0` — **o par inteiro deixa de pontuar por causa de uma
+perna**. Corrigido com clamp de ambas as pernas à band: o skew gasta-se do orçamento da band, não
+além dele. Coberto por teste.
 
 ---
 
@@ -338,13 +379,11 @@ parâmetro que diz onde parar de apertar. Método:
 
 > **Corrigido (implementação) — o passo 1 é onde isto falha na prática.** "Medir tempos até fill para
 > várias distâncias δ" pressupõe que existem várias distâncias. Não existem: a política converge para
-> um δ, todos os fills caem num bucket, `sxx = 0`, e a regressão não devolve nada — foi exatamente o
-> que aconteceu na corrida `paper` (secção 0.6, achado 1). **A variação de δ tem de ser imposta, não
-> esperada.** Duas fontes: (a) indexar o bucket pela distância real de *cada perna* ao mid — com o
-> skew ativo as duas pernas já estão a distâncias diferentes, e isso dá dois pontos de graça;
-> (b) dithering deliberado do δ entre requotes. O custo do dithering (algum reward perdido por não
-> estar sempre no δ ótimo corrente) é o preço de saber onde o ótimo está — e sem `k` não há regime,
-> como a secção 0.5 mostra.
+> um δ, todos os fills caem num bucket, e a regressão não devolve nada. **A variação de δ tem de ser
+> imposta, não esperada** — e o passo 3, a regressão, tem de usar os buckets *sem* fills, que são os
+> que fixam o `k`. Ver secção 0.7: foram precisas três correções (bucket por perna, MLE de Poisson
+> em vez da regressão log-linear, e dithering de δ), e só as três juntas identificam o `k`. O
+> dithering custa reward — 8.7% do líquido na medição — e é o preço de saber onde o ótimo está.
 >
 > **Nota (verificação repo):** para arrancar sem fills, o `ShadowFillEngine` (`xrp_bot_v9_4_1.py:820`)
 > caminha a profundidade real do livro com latência e slippage. Buckets com menos de N observações
@@ -660,6 +699,8 @@ tem custos que não cabem aqui.
 | §0.4 correção do solver de δ\* | **Verificado analiticamente** — `U'(D) > 0` para quaisquer parâmetros, logo a receita original não bracketa. Superado pelo objetivo completo da §0.5 |
 | §0.5 três regimes (MID / INTERIOR / BORDA) | **Verificado** — 8/8 testes de `lpbook/` passam e corri o varrimento da tabela eu próprio. `U(BORDA) < 0` é teorema |
 | §0.6 achados na implementação | **Verificado** — calibração não identificada reproduzida numa corrida `paper` real (priores intactos ao fim de 7 fills); ausência de WS/asyncio e de budget de order/cancel confirmada por leitura do código |
+| §0.7 correção da calibração | **Verificado** — 12/12 testes passam; `k` recuperado em 5 seeds × 72 h, erro absoluto médio 0.433 → 0.207. Amostra pequena (n=5): a direção é consistente, a amplitude ótima do dithering **não** está determinada |
+| §0.7 perna fora da band com skew | **Verificado** — reproduzido (2.4c numa band de 2.0c) e corrigido com clamp, coberto por teste |
 | Números do `scan` a $20 (4 rejeitados, 1 armado, +$2.89/d, rho 0.52) | **Verificado** — reproduzidos localmente |
 | §3.4 âncora do jump-diffusion | **Verificado** — `xrp_alpha.py` não existe; o código está em `xrp_bot_v9_4_1.py:1637` |
 | §6 reaproveitamentos (estado, fills, endpoints, CLOB, secrets) | **Verificado** — todos existem, âncoras em §0.1 |

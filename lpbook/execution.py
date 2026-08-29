@@ -19,17 +19,23 @@ class PaperExecutor:
         pass
 
     def poll_fills(self, st, dt):
+        """Devolve [(side, shares, level_c, adverse_c, delta_c), ...].
+
+        `delta_c` e a distancia da perna ao mid ANTES do fill -- e a distancia que
+        gerou o evento, e e a que a calibracao tem de registar (depois do fill o
+        mid ja saltou com o movimento adverso).
+        """
         out = []
         if st.bid:
-            sh, adv = self.market.try_fill(
-                "bid", abs(self.market.mid_c - st.bid.level_c), st.bid.size, dt)
+            d = abs(self.market.mid_c - st.bid.level_c)
+            sh, adv = self.market.try_fill("bid", d, st.bid.size, dt)
             if sh > 0:
-                out.append(("bid", sh, st.bid.level_c, adv))
+                out.append(("bid", sh, st.bid.level_c, adv, d))
         if st.ask:
-            sh, adv = self.market.try_fill(
-                "ask", abs(st.ask.level_c - self.market.mid_c), st.ask.size, dt)
+            d = abs(st.ask.level_c - self.market.mid_c)
+            sh, adv = self.market.try_fill("ask", d, st.ask.size, dt)
             if sh > 0:
-                out.append(("ask", sh, st.ask.level_c, adv))
+                out.append(("ask", sh, st.ask.level_c, adv, d))
         return out
 
 
@@ -89,4 +95,6 @@ class LiveExecutor:
     def poll_fills(self, st, dt):
         # em live, os fills chegam pelo WS de user; ligar ao mesmo listener dos
         # bots XRP e encaminhar para BookEngine.on_fill. Sem WS, nao inventa fills.
+        # Mesmo contrato do PaperExecutor: (side, shares, level_c, adverse_c,
+        # delta_c), com delta_c medido contra o mid do momento do fill.
         return []
