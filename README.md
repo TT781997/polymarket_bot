@@ -24,11 +24,13 @@ Todos os mercados são binários (YES/NO) resolvidos automaticamente via orácul
 
 ### 1.3 Fees oficiais do Polymarket (usados nos bots)
 
-**Taker Fee (v9.4.1)**
+**Taker Fee (v9.5.0, CLOB V2 — docs.polymarket.com/trading/fees)**
 ```latex
-fee = shares × price × 0.25 × (price × (1 - price))²
+fee = shares × 0.07 × price × (1 - price)
 ```
-- v9.4.1 adiciona `fee_buffer = 0.006` em todas as decisões.
+- p=0,50 → 1,75c/share (3,5% do notional); p=0,90 → 0,63c; p=0,97 → 0,20c. Maker paga 0.
+- A fórmula antiga (`0.25 × p × (p(1−p))²`) subestimava a taxa 2x–10x.
+- `fee_buffer = 0.006` é margem de slippage **por cima** da taxa real em todos os filtros de edge e no Kelly.
 
 **Maker Rebate (v5.3.1)**
 ```latex
@@ -62,10 +64,13 @@ p_UP = 1 / (1 + e^{-log_odds})
 ### 2.3 Monte Carlo (v5.3.1)
 5000 simulações offline antes do boot → GO/NO-GO automático.
 
-### 2.4 Kelly + Martingale (v9.4.1)
+### 2.4 Kelly fracionado (v9.5.0 — martingala removida)
 ```latex
-risk = kelly_fraction × edge × mart_level × mart_recovery_factor
+custo = ask + fee(ask);  b = (1 − custo) / custo
+risk  = min(kelly_fraction × (p − (1 − p) / b), kelly_max_risk_pct)
 ```
+- `kelly_fraction ≤ 0.25`, `kelly_max_risk_pct ≤ 0.02`, `max_daily_loss_pct ≤ 10` (validados no arranque).
+- O stake nunca depende de perdas anteriores. `ENDGAME_AGG` e o TP parcial estão desligados por omissão (hold até ao settlement).
 
 ---
 
@@ -155,7 +160,9 @@ Mercado com **forte viés para DOWN** (P(DN)=80.3%). O bot provavelmente vai ent
 
 ## 5. Configuração e Parametrização (detalhada)
 
-**secrets.txt** (obrigatório)  
+**Credenciais: variáveis de ambiente** (`PRIVATE_KEY`, `API_KEY`, `API_SECRET`, `API_PASSPHRASE`).
+`secrets.txt` é só fallback legado, está no `.gitignore` e gera aviso `[SECURITY]` ao ser lido.  
+**control.json** (kill switch, relido quando muda): `{"kill_switch": true}` ou `{"paused": true}` bloqueia novas entradas; JSON inválido bloqueia (fail closed).  
 **config.json** (v5.3.1 – hot-reload a cada 15s)  
 **BotConfig** (v9.4.1 – editável no código)
 

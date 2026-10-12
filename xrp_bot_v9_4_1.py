@@ -129,20 +129,22 @@ class BotConfig:
     secrets_path: str = "secrets.txt"
     bankroll_demo: Decimal = Decimal("100.0")
     slippage_tolerance: float = 0.001
-    # v9.4.0 FEE_REAL: buffer applied to all edge calculations
+    # v9.5.0: fee_buffer = slippage + safety margin ON TOP of the real taker fee
     fee_buffer: float = 0.006
     gas_cost_usdc: float = 0.0
     # v9.4.0 Shadow Trading: realistic fill simulation in dry_run
     shadow_latency_ms: float = 80.0       # simulated network+matching latency
     shadow_max_slippage_pct: float = 0.02  # max 2% slippage from best ask
-    mart_max_mult: int = 4
+    # v9.5.0: martingale removed -- level is pinned to 1 (validated)
+    mart_max_mult: int = 1
     max_market_exposure: float = 0.28
-    kelly_max_risk_pct: float = 0.065
-    max_session_loss_pct: float = 1.0
+    kelly_max_risk_pct: float = 0.02
     max_consecutive_losses: int = 4
     max_bankroll_exposure: float = 0.58
-    max_daily_loss_pct: float = 50.0
-    max_hourly_loss_pct: float = 20.0
+    max_daily_loss_pct: float = 8.0
+    max_hourly_loss_pct: float = 5.0
+    # v9.5.0: kill switch -- {"kill_switch": true} or {"paused": true} blocks new entries
+    control_file: str = "control.json"
     hourly_pause_duration_s: float = 900.0
     arb_resolution: float = 1.00
     arb_min_shares: float = 0.10
@@ -161,7 +163,8 @@ class BotConfig:
     bid_ask_min_ratio: float = 0.983
     min_liquidity: float = 80.0
     max_active_trades: int = 8
-    aggressive_endgame_active: bool = True
+    # v9.5.0: off by default -- 70-98c entries are EV-negative after real taker fees
+    aggressive_endgame_active: bool = False
     endgame_trigger_s: float = 45.0
     aggressive_endgame_s: float = 25.0
     aggressive_endgame_risk: float = 0.08
@@ -170,7 +173,8 @@ class BotConfig:
     endgame_high_z_risk: float = 0.10
     endgame_high_z_thresh: float = 2.5
     rollback_limit_premium: float = 0.02
-    partial_tp_active: bool = True
+    # v9.5.0: off by default -- Monte Carlo showed sell-before-settlement is EV-negative; hold
+    partial_tp_active: bool = False
     partial_tp_fraction: float = 1.0
     bayesian_prior: float = 0.50
     bayesian_likelihood_std: float = 0.008
@@ -180,7 +184,7 @@ class BotConfig:
     vol_edge_sigma_floor: float = 0.004
     es_min_threshold: float = 2.55
     kelly_assumed_edge: float = 0.040
-    kelly_fraction: float = 0.48
+    kelly_fraction: float = 0.25
     vol_kelly_target: float = 0.025
     kelly_assumed_edge_val: float = 0.040
     hft_window_seconds: float = 4.0
@@ -251,33 +255,38 @@ class BotConfig:
     vol_regime_high_thresh: float = 1.20
     vol_short_weight: float = 0.65
     vol_hysteresis_s: float = 45.0
-    # v9.4.0 martingale optimization
-    mart_recovery_factor: float = 1.15
-    kelly_mart_boost: float = 0.30
 
     def validate(self) -> None:
         if self.live_trading and not self.polymarket_private_key:
             raise ValueError("polymarket_private_key required for LIVE_TRADING")
-        if self.mart_max_mult > 5:
-            raise ValueError("mart_max_mult must be <= 5")
-        if self.kelly_max_risk_pct > 0.15:
-            raise ValueError("kelly_max_risk_pct must be <= 0.15 (15%)")
+        if self.mart_max_mult != 1:
+            raise ValueError("mart_max_mult must be 1 (martingale removed)")
+        if self.kelly_max_risk_pct > 0.02:
+            raise ValueError("kelly_max_risk_pct must be <= 0.02 (2%)")
         if self.min_prob_entry < 0.50:
             raise ValueError("min_prob_entry must be >= 0.50 (50%)")
-        if self.kelly_fraction > 0.50:
-            raise ValueError("kelly_fraction must be <= 0.50 (50%)")
+        if self.kelly_fraction > 0.25:
+            raise ValueError("kelly_fraction must be <= 0.25 (quarter Kelly)")
+        if not 0.0 < self.max_daily_loss_pct <= 10.0:
+            raise ValueError("max_daily_loss_pct must be in (0, 10]")
 
     @classmethod
     def from_env_and_secrets(cls, secrets_path: str = "secrets.txt") -> "BotConfig":
         sfile = _load_secrets_file(secrets_path)
+        # v9.5.0 SECURITY: env vars take precedence; secrets.txt is a legacy
+        # fallback only (gitignored). Values are never logged.
         def _get(key: str, default: str = "", *aliases: str) -> str:
-            for k in (key, *aliases):
-                if k in sfile:
-                    return sfile[k]
             for k in (key, *aliases):
                 v = os.environ.get(k, "")
                 if v:
                     return v
+            for k in (key, *aliases):
+                if k in sfile:
+                    logging.getLogger("bot_xrp").warning(
+                        f"[SECURITY] {k} read from {secrets_path} -- "
+                        f"move it to an environment variable"
+                    )
+                    return sfile[k]
             return default
         cfg = cls()
         cfg.secrets_path = secrets_path
@@ -1104,9 +1113,8 @@ class TradeStateManager:
                 assert isinstance(data, dict)
                 br = _d(data.get("bankroll", str(self._bankroll_demo)))
                 self.state = TradeState(
-                    current_martingale_level=int(
-                        data.get("current_martingale_level", 1)
-                    ),
+                    # v9.5.0: martingale removed -- ignore any persisted level
+                    current_martingale_level=1,
                     accumulated_loss_session=_d(
                         data.get("accumulated_loss_session", "0")
                     ),
@@ -1176,8 +1184,7 @@ class TradeStateManager:
             if effective_new != old:
                 self.state.current_martingale_level = effective_new
                 log_warn(
-                    f"[MART_OPT] level=x{effective_new} "
-                    f"(recovery_factor={cfg.mart_recovery_factor:.2f}) | "
+                    f"[MART_OPT] level=x{effective_new} | "
                     f"acc_loss=${self.state.accumulated_loss_session:.4f} | "
                     f"edge={edge:+.4f}"
                 )
@@ -1188,29 +1195,11 @@ class TradeStateManager:
                     f"edge={edge:+.4f}"
                 )
 
-    def calc_next_stake(
-        self, base_stake: Decimal, ask: float, token_id: str,
-        fee_fn: Callable[[str], float], bankroll: Decimal,
-        edge: float = 0.0, kelly_assumed_edge: float = 0.040,
-        mart_recovery_factor: float = 1.15, kelly_mart_boost: float = 0.30,
-    ) -> Decimal:
-        # v9.4.0: apply mart_recovery_factor to amplify recovery staking
-        raw_stake = base_stake * _d(self.state.mart_level) * _d(mart_recovery_factor)
-        fee = _d(fee_fn(token_id))
-        acc = self.state.accumulated_loss_session
-        if acc > _ZERO and 0.0 < ask < 1.0:
-            ask_d = _d(ask)
-            margin = _ONE - ask_d * (_ONE + fee)
-            if margin > _d("1e-9"):
-                min_stake = (acc / margin) * ask_d * (_ONE + fee)
-                if min_stake > raw_stake:
-                    raw_stake = min_stake
-        # v9.4.0: kelly boost when edge significantly above expected
-        if edge > kelly_assumed_edge * 1.2:
-            raw_stake = _dq(raw_stake * _d(1.0 + kelly_mart_boost))
+    def calc_next_stake(self, base_stake: Decimal, bankroll: Decimal) -> Decimal:
+        # v9.5.0: fixed-fractional stake. No loss recovery, no edge boost:
+        # stake never depends on past losses.
         cap = _dq(bankroll * _d("0.20"))
-        raw_stake = min(_dq(raw_stake), cap, bankroll)
-        return raw_stake
+        return min(_dq(base_stake), cap, bankroll)
 
     def update_daily_pnl(self, round_pnl: Decimal) -> None:
         self.state.daily_pnl += round_pnl
@@ -1259,9 +1248,41 @@ class CapitalSafetyMonitor:
         self._cfg = cfg
         self._audit = audit
         self._last_safety_check_ts: float = 0.0
+        self._control_mtime: Optional[float] = None
+        self._control_blocked: bool = False
+
+    def _control_blocks(self) -> bool:
+        """Kill switch: control.json {"kill_switch": true} or {"paused": true}.
+
+        Re-read only when mtime changes. Unreadable or invalid file blocks
+        (fail closed); a missing file does not block.
+        """
+        try:
+            mtime = os.stat(self._cfg.control_file).st_mtime
+        except FileNotFoundError:
+            self._control_mtime = None
+            self._control_blocked = False
+            return False
+        except OSError:
+            return True
+        if mtime == self._control_mtime:
+            return self._control_blocked
+        self._control_mtime = mtime
+        try:
+            data = json.loads(Path(self._cfg.control_file).read_text(encoding="utf-8"))
+            blocked = bool(data.get("kill_switch") or data.get("paused"))
+        except (OSError, ValueError, AttributeError):
+            blocked = True
+        if blocked != self._control_blocked:
+            log_warn(f"[SAFETY] KILL SWITCH {'ON' if blocked else 'OFF'} "
+                     f"({self._cfg.control_file})")
+        self._control_blocked = blocked
+        return blocked
 
     def check(self, ctx: "BotContext") -> bool:
         if ctx.trading_disabled:
+            return True
+        if self._control_blocks():
             return True
         now = time.time()
         state = self._tsm.state
@@ -2132,46 +2153,28 @@ class HFTWindow:
 ###############################################################################
 # SECTION 19 -- FEE SYSTEM
 ###############################################################################
+# Crypto taker fee rate (docs.polymarket.com/trading/fees, CLOB V2).
+# Makers pay 0. Override per market once feeSchedule is read from the API.
+CRYPTO_TAKER_FEE_RATE = 0.07
+
+
 def polymarket_fee(
-    shares: float, price: float,
-    fee_rate: float = 0.25, exponent: int = 2
+    shares: float, price: float, fee_rate: float = CRYPTO_TAKER_FEE_RATE
 ) -> float:
-    """Compute Polymarket taker fee using official formula.
+    """Polymarket taker fee: fee = C x feeRate x p x (1 - p).
 
-    Formula (from docs.polymarket.com/trading/fees):
-        fee = C x p x feeRate x (p x (1 - p))^exponent
-
-    Where:
-        C        = number of shares traded
-        p        = share price (0.0 to 1.0)
-        feeRate  = 0.25 for Crypto markets
-        exponent = 2 for Crypto markets
-
-    The effective rate peaks at 1.5625% at p=0.50 and decreases
-    symmetrically toward both extremes (0% and 100%).
-
-    Fee is paid in USDC on buys (deducted from USDC spent)
-    and in USDC on sells (deducted from USDC received).
-
-    Args:
-        shares: Number of shares (C).
-        price:  Share price in [0.001, 0.999].
-        fee_rate: Market fee rate parameter (default 0.25 for Crypto).
-        exponent: Market exponent parameter (default 2 for Crypto).
-
-    Returns:
-        Fee amount in USDC.
+    Crypto: p=0.50 -> 1.75c/share (3.5% of notional); p=0.90 -> 0.63c;
+    p=0.97 -> 0.20c. Charged at match time (CLOB V2), never on maker fills.
     """
     p = max(0.001, min(0.999, price))
-    return shares * p * fee_rate * (p * (1.0 - p)) ** exponent
+    return shares * fee_rate * p * (1.0 - p)
 
 
 def polymarket_fee_decimal(
-    shares: Decimal, price: float,
-    fee_rate: float = 0.25, exponent: int = 2
+    shares: Decimal, price: float, fee_rate: float = CRYPTO_TAKER_FEE_RATE
 ) -> Decimal:
     """Decimal version of polymarket_fee for trade accounting."""
-    return _dq(_d(polymarket_fee(float(shares), price, fee_rate, exponent)))
+    return _dq(_d(polymarket_fee(float(shares), price, fee_rate)))
 
 
 def fee_rate_lut(
@@ -2219,33 +2222,32 @@ def calc_imbalance(
     total = bid_size + ask_size
     return bid_size / total if total > 1e-9 else None
 
-def calc_kelly_bayesian(
-    p_hat: float, ask: float, mart_level: int, cfg: BotConfig
-) -> float:
+def calc_kelly_bayesian(p_hat: float, ask: float, cfg: BotConfig) -> float:
+    """Fractional Kelly for a hold-to-settlement taker buy, net of taker fee."""
     if ask <= 0.0 or ask >= 1.0:
         return 0.0
-    kelly = p_hat - (1.0 - p_hat) / ((1.0 - ask) / ask)
+    cost = ask + polymarket_fee(1.0, ask)
+    if cost >= 1.0:
+        return 0.0
+    net_odds = (1.0 - cost) / cost
+    kelly = p_hat - (1.0 - p_hat) / net_odds
     if kelly <= 0.0:
         return 0.0
-    return min(kelly * cfg.kelly_fraction * mart_level,
-               cfg.kelly_max_risk_pct * cfg.mart_max_mult)
+    return min(kelly * cfg.kelly_fraction, cfg.kelly_max_risk_pct)
 
-def calculate_dynamic_tp(
-    trade: Trade, fee_cache: Dict[str, int], target_net_roi: float = 0.02
-) -> float:
+def calculate_dynamic_tp(trade: Trade, target_net_roi: float = 0.02) -> float:
+    """Bid at which a taker sell nets total_out x (1 + roi) after the real fee."""
     shares = trade.shares
     total_out = trade.total_out
     if shares < _d("1e-9") or total_out < _d("1e-9"):
         return 1.0
-    fee_rate = fee_rate_lut(trade.token_id or "", fee_cache)
-    net_mult = _d(1.0) - _d(fee_rate)
-    if net_mult < _d("1e-9"):
-        return 1.0
-    bid_tp = float(
-        (total_out * (_ONE + _d(target_net_roi))) / (shares * net_mult)
-    )
-    if bid_tp >= 0.995:
-        return 1.0
+    target_per_share = _safe_float(total_out * (_ONE + _d(target_net_roi)) / shares)
+    bid_tp = target_per_share
+    # Fixed point of bid - fee(bid) = target; converges since d(fee)/d(bid) < 0.07
+    for _ in range(4):
+        bid_tp = target_per_share + polymarket_fee(1.0, bid_tp)
+        if bid_tp >= 0.995:
+            return 1.0
     return round(bid_tp, 6)
 
 ###############################################################################
@@ -3652,31 +3654,13 @@ async def logic_loop(
             invested_pure = _dq(shares_d * _d(ask_f))
         else:
             base_risk_amount = _sizing_bankroll * _d(risk)
-            # Change 5: compute edge for this side; pass to calc_next_stake for kelly boost
-            _ot_p_hat = p_hat_up if side == "UP" else p_hat_down
-            _ot_edge  = max(0.0, _ot_p_hat - ask_f)
-            recovery_stake = tsm.calc_next_stake(
-                base_risk_amount, ask_f, tid,
-                lambda t: fee_rate_lut(t, ctx.fee_cache,
-                                       cfg.default_taker_fee_bps),
-                _sizing_bankroll,
-                edge=_ot_edge,
-                kelly_assumed_edge=cfg.kelly_assumed_edge,
-                mart_recovery_factor=cfg.mart_recovery_factor,
-                kelly_mart_boost=cfg.kelly_mart_boost,
-            )
-            invested_pure = _dq(min(recovery_stake,
-                                    _sizing_bankroll * _d(risk) *
-                                    _d(mart_level)))
+            invested_pure = tsm.calc_next_stake(base_risk_amount, _sizing_bankroll)
             shares_d = _dq(invested_pure / _d(ask_f)) if ask_f > 1e-9 else _ZERO
-        max_per = _sizing_bankroll * _d(min(
-            cfg.kelly_max_risk_pct * mart_level,
-            cfg.kelly_max_risk_pct * cfg.mart_max_mult
-        ))
+        max_per = _sizing_bankroll * _d(cfg.kelly_max_risk_pct)
         if invested_pure > max_per and fixed_shares is None:
             invested_pure = _dq(max_per)
             shares_d = _dq(invested_pure / _d(ask_f)) if ask_f > 1e-9 else _ZERO
-        # Polymarket non-linear fee: fee = C x p x 0.25 x (p x (1-p))^2
+        # Polymarket taker fee: fee = C x 0.07 x p x (1-p)
         fee_buy = polymarket_fee_decimal(shares_d, ask_f)
         total_out = _dq(invested_pure + fee_buy)
         # v9.4.0 FEE_REAL: log real fee cost per entry
@@ -3968,7 +3952,8 @@ async def logic_loop(
                 if _a < cfg.min_prob_entry:
                     continue
                 _p = p_hat_up if _s == "UP" else p_hat_down
-                if _p - _a < cfg.min_vwap_edge:
+                if _p - _a - polymarket_fee(1.0, _a) - cfg.fee_buffer < \
+                        cfg.min_vwap_edge:
                     continue
                 if cfg.aggressive_endgame_min_c - 1e-6 <= _a <= \
                         cfg.aggressive_endgame_max_c + 1e-6:
@@ -3980,26 +3965,21 @@ async def logic_loop(
                 _ultra = _is_ultra_bull(binance, funding, cfg)
                 if _ultra:
                     _eg_side, _eg_tid = "UP", meta["up"]
-                    _eg_risk = min(cfg.endgame_high_z_risk * eff_mart,
-                                   cfg.kelly_max_risk_pct * cfg.mart_max_mult)
+                    _eg_risk = cfg.endgame_high_z_risk
                     _eg_label = "ULTRA_BULL"
                 else:
                     _eg_side, _eg_tid, _, _eg_z = max(_candidates,
                                                       key=lambda x: x[2])
                     _z_abs = abs(_eg_z) if _eg_z is not None else 0.0
                     if _z_abs > cfg.endgame_high_z_thresh:
-                        _eg_risk = min(cfg.endgame_high_z_risk * eff_mart,
-                                       cfg.kelly_max_risk_pct *
-                                       cfg.mart_max_mult)
+                        _eg_risk = cfg.endgame_high_z_risk
                         _eg_label = f"HIGH_Z={_z_abs:.2f}"
                     else:
-                        _eg_risk = min(cfg.aggressive_endgame_risk * eff_mart,
-                                       cfg.kelly_max_risk_pct * eff_mart)
+                        _eg_risk = cfg.aggressive_endgame_risk
                         _eg_label = f"Z={_eg_z:+.2f}" if _eg_z is not None \
                             else "Z=n/a"
-                # v9.4.0: cap at max risk
-                _eg_risk = min(_eg_risk,
-                               cfg.kelly_max_risk_pct * cfg.mart_max_mult)
+                # v9.5.0: hard cap at per-trade risk, no martingale multiplier
+                _eg_risk = min(_eg_risk, cfg.kelly_max_risk_pct)
                 await open_trade(
                     _eg_side, "ENDGAME_AGG", rstr, risk=_eg_risk,
                     token_id=_eg_tid,
@@ -4023,7 +4003,7 @@ async def logic_loop(
                 _tp_bid = ctx.best_bids.get(_tp_t.side.lower())
                 if _tp_bid is None:
                     continue
-                _tp_target = calculate_dynamic_tp(_tp_t, ctx.fee_cache)
+                _tp_target = calculate_dynamic_tp(_tp_t)
                 if _tp_target >= 0.995:
                     continue
                 if _tp_bid < _tp_target:
@@ -4101,12 +4081,13 @@ async def logic_loop(
                 if not _should:
                     log_gambling(f"BLOCKED reason=low_edge_score | rem={rstr}")
                     continue
-                _raw_edge = _gbm_prob - g_ask - cfg.fee_buffer
+                _raw_edge = (_gbm_prob - g_ask - polymarket_fee(1.0, g_ask)
+                             - cfg.fee_buffer)
                 if _raw_edge < cfg.min_vwap_edge:
                     log_gambling(f"BLOCKED reason=raw_edge_too_low | rem={rstr}")
                     continue
                 _kelly_pre = vol_trackers[g_side].adaptive_kelly(
-                    calc_kelly_bayesian(_gbm_prob, g_ask, eff_mart, cfg), cfg
+                    calc_kelly_bayesian(_gbm_prob, g_ask, cfg), cfg
                 )
                 if _kelly_pre <= 0.0:
                     log_gambling(f"BLOCKED reason=kelly_zero | rem={rstr}")
@@ -4116,13 +4097,10 @@ async def logic_loop(
                 l2_g = ctx.l2_up if g_side == "UP" else ctx.l2_down
                 _book_asks = l2_g.asks[:10]
                 _vwap = simulate_market_buy_l2(_book_asks, _tgt_shares)
-                _fee_t = fee_rate_lut(
-                    meta["up"] if g_side == "UP" else meta["down"],
-                    ctx.fee_cache, cfg.default_taker_fee_bps
-                )
                 if _vwap is None:
                     log_gambling(f"BLOCKED reason=vwap_depth_exhausted | rem={rstr}")
                     continue
+                _fee_t = polymarket_fee(1.0, _vwap) + cfg.fee_buffer
                 _liq_bias = (micro_g.liquidity_signal - 0.5) * 0.1
                 _blended_prob = max(0.01, min(0.99, _gbm_prob + _liq_bias))
                 _vwap_edge = _blended_prob - _vwap - _fee_t
@@ -4587,12 +4565,22 @@ def _run_tests() -> None:
     _assert(cfg.gamb_max_ask_c == 97.0, "gamb_max_ask_c=97.0")
     _assert(cfg.min_prob_entry == 0.505, "min_prob_entry=0.505")
     _assert(cfg.min_vwap_edge == 0.005, "min_vwap_edge=0.005")
-    _assert(cfg.kelly_fraction == 0.48, "kelly_fraction=0.48")
-    _assert(cfg.kelly_max_risk_pct == 0.065, "kelly_max_risk_pct=0.065")
+    _assert(cfg.kelly_fraction == 0.25, "kelly_fraction=0.25")
+    _assert(cfg.kelly_max_risk_pct == 0.02, "kelly_max_risk_pct=0.02")
+    _assert(cfg.max_daily_loss_pct == 8.0, "max_daily_loss_pct=8.0")
+    _assert(not cfg.aggressive_endgame_active, "ENDGAME_AGG off by default")
+    _assert(not cfg.partial_tp_active, "partial TP off by default (hold)")
     _assert(cfg.max_market_exposure == 0.28, "max_market_exposure=0.28")
     _assert(cfg.max_bankroll_exposure == 0.58, "max_bankroll_exposure=0.58")
     _assert(cfg.max_position_size_usd == 14.5, "max_position_size_usd=14.5")
-    _assert(cfg.mart_max_mult == 4, "mart_max_mult=4")
+    _assert(cfg.mart_max_mult == 1, "mart_max_mult=1 (martingale removed)")
+    for _bad in ({"mart_max_mult": 2}, {"kelly_fraction": 0.48},
+                 {"kelly_max_risk_pct": 0.065}, {"max_daily_loss_pct": 50.0}):
+        try:
+            BotConfig(**_bad).validate()
+            _assert(False, f"validate rejects {_bad}")
+        except ValueError:
+            _assert(True, f"validate rejects {_bad}")
     _assert(cfg.fee_buffer == 0.006, "fee_buffer=0.006")
     _assert(cfg.gas_cost_usdc == 0.0, "gas_cost_usdc=0.0")
 
@@ -4604,8 +4592,29 @@ def _run_tests() -> None:
     _assert('LMSRPricer' not in dir() or True, "LMSRPricer removed")
 
     # Fee system
-    fee = polymarket_fee(1.0, 0.50)
-    _assert(fee >= 0.0, f"polymarket_fee returns non-negative (got {fee})")
+    for _p, _c in ((0.50, 0.0175), (0.90, 0.0063), (0.97, 0.002037)):
+        _f = polymarket_fee(1.0, _p)
+        _assert(abs(_f - _c) < 1e-6, f"fee(p={_p})={_f:.6f} ~ {_c}")
+    _assert(abs(polymarket_fee(100.0, 0.5) / 50.0 - 0.035) < 1e-9,
+            "fee at p=0.50 = 3.5% of notional")
+
+    # Kelly net of fees, capped, no martingale multiplier
+    _assert(calc_kelly_bayesian(0.50, 0.50, cfg) == 0.0,
+            "kelly=0 when p_hat == ask (fee makes edge negative)")
+    _assert(calc_kelly_bayesian(0.510, 0.50, cfg) == 0.0,
+            "kelly=0 when edge 1c < fee 1.75c")
+    _assert(calc_kelly_bayesian(0.99, 0.50, cfg) == cfg.kelly_max_risk_pct,
+            "kelly capped at kelly_max_risk_pct")
+
+    # Dynamic TP covers the real sell fee
+    _tp_trade = Trade(side="UP", ask=0.50, bid_at_buy=0.49, eff_c=51.75,
+                      shares=_d("10"), target=None, type="GAMBLING",
+                      invested_pure=_d("5.0"), fee_buy=_d("0.0875"),
+                      total_out=_d("5.0875"), token_id="x")
+    _tp_bid = calculate_dynamic_tp(_tp_trade)
+    _tp_net = _tp_bid - polymarket_fee(1.0, _tp_bid)
+    _assert(abs(_tp_net * 10.0 - 5.0875 * 1.02) < 1e-4,
+            f"TP bid {_tp_bid:.4f} nets target after fee")
 
     # Jump diffusion
     p_up, p_dn = compute_jump_diffusion_probability(
@@ -4619,6 +4628,24 @@ def _run_tests() -> None:
     tsm_t.state.consecutive_losses = 3
     tsm_t.update_martingale(_d("0.05"), cfg)
     _assert(tsm_t.state.consecutive_losses == 0, "WIN resets consecutive_losses")
+    tsm_t.update_martingale(_d("-1.0"), cfg)
+    _assert(tsm_t.state.mart_level == 1, "LOSS keeps level at x1")
+    _assert(tsm_t.calc_next_stake(_d("0.20"), _d("10.0")) == _d("0.20"),
+            "stake independent of accumulated losses")
+
+    # Kill switch
+    _ctl = Path("/tmp/_test_v950_control.json")
+    _ctl.write_text('{"kill_switch": true}', encoding="utf-8")
+    _mon = CapitalSafetyMonitor(tsm_t, BotConfig(control_file=str(_ctl)), None)
+    _assert(_mon._control_blocks(), "control.json kill_switch blocks")
+    _ctl.write_text('{"kill_switch": false, "paused": false}', encoding="utf-8")
+    os.utime(_ctl, (time.time() + 5, time.time() + 5))
+    _assert(not _mon._control_blocks(), "control.json cleared unblocks")
+    _ctl.write_text('not json', encoding="utf-8")
+    os.utime(_ctl, (time.time() + 10, time.time() + 10))
+    _assert(_mon._control_blocks(), "invalid control.json fails closed")
+    _ctl.unlink()
+    _assert(not _mon._control_blocks(), "missing control.json does not block")
 
     # VolatilityEdgeTracker
     vet = VolatilityEdgeTracker(cfg)

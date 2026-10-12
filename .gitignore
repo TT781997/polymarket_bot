@@ -1,0 +1,13 @@
+# Segredos: nunca commitar
+secrets.txt
+*.env
+.env*
+# Estado e logs de runtime
+trade_state.json
+trade_audit.jsonl
+control.json
+*.log
+logs/
+__pycache__/
+*.pyc
+.DS_Store
