@@ -187,12 +187,20 @@ CLOB V2: `POLYMARKET_FUNDER` (ou `WALLET_ADDRESS`, carteira proxy/safe com pUSD)
 ## 7. Instalação e Execução
 
 ```bash
-pip install websockets py-clob-client-v2 web3 requests orjson numpy
+pip install websockets py-clob-client-v2 web3 requests orjson numpy uvloop coincurve
 python xrp_true_market_maker_v5_3_1.py
 python xrp_bot_v9_4_1.py
 ```
 
 **Flag útil** (v9.4.1): `--test`
+
+**Latência (v9.5.0, Linux)**
+- `uvloop` (event loop) e `coincurve` (assinatura ECDSA nativa) são usados automaticamente se instalados; sem `coincurve` o arranque avisa `[LAT]`.
+- A ordem devolve assim que o CLOB responde: o polling de hashes do `post_order` (0,25 s até 30 s) está desativado; os fills chegam pelo user WS.
+- Em cada ciclo, o bot pré-aquece a info do mercado (tick, neg_risk, taxa) e a assinatura: a primeira ordem custa só assinar + 1 POST.
+- O loop de decisão aglutina eventos em atraso e decide uma vez sobre o livro mais recente.
+- Métricas no log: `[LAT] prewarm sign=…ms` por ciclo e `[LAT] order sign=…ms post=…ms | total p50/p95` por ordem.
+- O resto é rede: corre o bot num VPS perto dos servidores da Polymarket (região não verificada) e compara o p50 de `post`.
 
 ---
 

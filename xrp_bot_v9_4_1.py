@@ -48,6 +48,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import functools
+import concurrent.futures
+import importlib.util
 
 # v9.4.0: USER_WS OPEN log throttle -- prevent spam on rapid reconnects
 USER_WS_OPEN_LOG_INTERVAL: float = 4.0
@@ -267,6 +269,9 @@ class BotConfig:
         if self.live_trading and self.polymarket_signature_type != 0 \
                 and not self.polymarket_funder:
             raise ValueError("polymarket_funder required for signature_type != 0")
+        if self.live_trading and self.partial_tp_active:
+            raise ValueError("partial_tp_active requires a live SELL path "
+                             "(close_trade* only books PnL) -- hold to settlement")
         if self.mart_max_mult != 1:
             raise ValueError("mart_max_mult must be 1 (martingale removed)")
         if self.kelly_max_risk_pct > 0.02:
@@ -784,6 +789,15 @@ class EventBus:
         except asyncio.TimeoutError:
             return None
 
+    def drain(self) -> List[MarketEvent]:
+        """Pop every queued event without waiting."""
+        events: List[MarketEvent] = []
+        while True:
+            try:
+                events.append(self._q.get_nowait())
+            except asyncio.QueueEmpty:
+                return events
+
     def qsize(self) -> int:
         return self._q.qsize()
 
@@ -994,6 +1008,9 @@ class BotContext:
     trading_disabled: bool = False
     # v9.5.0: set per cycle when the market fee schedule differs from the EV model
     fee_model_mismatch: bool = False
+    # v9.5.0 LATENCY: dedicated order threads + rolling order latency (ms)
+    order_executor: Any = None
+    order_latency_ms: Any = field(default_factory=lambda: deque(maxlen=200))
     session_stop_reason: str = ""
     pending_orders: Dict[str, Dict] = field(default_factory=dict)
     last_reconciled_bankroll: Decimal = field(default_factory=lambda: _ZERO)
@@ -2457,6 +2474,47 @@ def _compute_worst_price(side: str, price: float, slippage: float) -> float:
     worst = price + slippage if side == "BUY" else price - slippage
     return round(max(0.01, min(0.99, worst)), 2)
 
+def disable_trade_hash_polling(client: Any) -> bool:
+    """py-clob-client-v2 post_order() polls get_trades every 0.25 s (up to 30 s)
+    for settlement tx hashes after the order is accepted. Fills are tracked via
+    the user WS, so return as soon as the CLOB answers. False if the SDK changed."""
+    if not hasattr(type(client), "_resolve_transactions_hashes"):
+        return False
+    client._resolve_transactions_hashes = lambda response: response
+    return True
+
+
+def record_order_latency(ctx: "BotContext", sign_ms: float, post_ms: float) -> None:
+    ctx.order_latency_ms.append(sign_ms + post_ms)
+    window = sorted(ctx.order_latency_ms)
+    p50 = window[len(window) // 2]
+    p95 = window[min(len(window) - 1, int(len(window) * 0.95))]
+    log_info(f"[LAT] order sign={sign_ms:.1f}ms post={post_ms:.1f}ms | "
+             f"total p50={p50:.1f}ms p95={p95:.1f}ms n={len(window)}")
+
+
+async def prewarm_order_path(ctx: "BotContext", token_id: str) -> None:
+    """Sign (never post) a throwaway order: caches the exchange version and
+    tick size and warms the signing code, so the first real order pays only
+    signing + one POST. Logs the signing time as a per-cycle benchmark."""
+    try:
+        from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions
+        client = ctx.clob_client
+
+        def _sign() -> float:
+            started = time.perf_counter()
+            client.create_order(
+                OrderArgs(token_id=token_id, price=0.5, size=5.0, side="BUY"),
+                PartialCreateOrderOptions())
+            return (time.perf_counter() - started) * 1000.0
+
+        sign_ms = await asyncio.get_running_loop().run_in_executor(
+            ctx.order_executor, _sign)
+        log_info(f"[LAT] prewarm sign={sign_ms:.1f}ms")
+    except Exception as exc:
+        log_warn(f"[LAT] prewarm failed: {type(exc).__name__}: {exc}")
+
+
 async def execute_trade(
     ctx: BotContext,
     token_id: str,
@@ -2504,18 +2562,27 @@ async def execute_trade(
         client = ctx.clob_client
         options = PartialCreateOrderOptions()
 
-        def _send() -> Any:
+        def _send() -> Tuple[Any, float, float]:
+            started = time.perf_counter()
             if use_limit:
                 order = client.create_order(
                     OrderArgs(token_id=token_id, price=price, size=shares,
                               side=side), options)
-                return client.post_order(order, OrderType.GTC, post_only=True)
-            order = client.create_market_order(
-                MarketOrderArgs(token_id=token_id, amount=amount, side=side,
-                                price=price), options)
-            return client.post_order(order, OrderType.FOK)
+            else:
+                order = client.create_market_order(
+                    MarketOrderArgs(token_id=token_id, amount=amount, side=side,
+                                    price=price), options)
+            signed = time.perf_counter()
+            if use_limit:
+                result = client.post_order(order, OrderType.GTC, post_only=True)
+            else:
+                result = client.post_order(order, OrderType.FOK)
+            return (result, (signed - started) * 1000.0,
+                    (time.perf_counter() - signed) * 1000.0)
 
-        response = await asyncio.get_running_loop().run_in_executor(None, _send)
+        response, sign_ms, post_ms = await asyncio.get_running_loop() \
+            .run_in_executor(ctx.order_executor, _send)
+        record_order_latency(ctx, sign_ms, post_ms)
         if not isinstance(response, dict) or not response.get("success") \
                 or response.get("errorMsg"):
             error = response.get("errorMsg") if isinstance(response, dict) \
@@ -2638,12 +2705,14 @@ async def fetch_market_fee_info(
 
     Returns None when unavailable. Missing fd means fees disabled -> (0, 0).
     """
-    client = ctx.clob_ro_client or ctx.clob_client
+    # Live client first: the same call warms its tick/neg_risk/fee caches,
+    # removing two round trips from the first order of the cycle.
+    client = ctx.clob_client or ctx.clob_ro_client
     if client is None:
         return None
     try:
         result = await asyncio.get_running_loop().run_in_executor(
-            None, client.get_clob_market_info, condition_id
+            ctx.order_executor, client.get_clob_market_info, condition_id
         )
     except Exception as exc:
         log_warn(f"[FEE] get_clob_market_info failed: {type(exc).__name__}: {exc}")
@@ -3827,12 +3896,13 @@ async def logic_loop(
         event = await ctx.event_bus.consume(timeout=0.2)
         if event is None:
             continue
-        if event.type == EventType.MARKET_RESOLVED:
-            continue
-        if event.type == EventType.SHUTDOWN:
+        # v9.5.0 LATENCY: state lives in ctx, events only wake the loop.
+        # Coalesce the backlog and decide once on the latest book.
+        event_types = {event.type} | {e.type for e in ctx.event_bus.drain()}
+        if EventType.SHUTDOWN in event_types:
             break
-        if event.type not in (EventType.PRICE_UPDATE, EventType.CYCLE_TICK,
-                              EventType.BOOK_SNAPSHOT):
+        if not event_types & {EventType.PRICE_UPDATE, EventType.CYCLE_TICK,
+                              EventType.BOOK_SNAPSHOT}:
             continue
 
 
@@ -4215,6 +4285,14 @@ async def main() -> None:
             else:
                 creds = ctx.clob_client.create_or_derive_api_key()
             ctx.clob_client.set_api_creds(creds)
+            ctx.order_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="clob-orders")
+            if not disable_trade_hash_polling(ctx.clob_client):
+                log_warn("[LAT] SDK has no _resolve_transactions_hashes -- "
+                         "post_order may block polling trades")
+            if importlib.util.find_spec("coincurve") is None:
+                log_warn("[LAT] coincurve not installed -- order signing uses "
+                         "the slow pure-Python ECDSA backend (pip install coincurve)")
             log_info("[BOOT] SDK V2 -- LIVE TRADING ACTIVE")
         else:
             log_info("[BOOT] SDK V2 -- DEMO MODE")
@@ -4327,6 +4405,8 @@ async def main() -> None:
                 f"{'MISMATCH -- entries BLOCKED' if ctx.fee_model_mismatch else 'ok'}"
                 f" | slug={slug}"
             )
+        if ctx.clob_client is not None:
+            await prewarm_order_path(ctx, meta["up"])
         ctx.resolved_event.clear()
         ctx.resolved_winner_asset = None
         ctx.current_condition_id = meta["id"]
@@ -4657,6 +4737,7 @@ def _run_tests() -> None:
             _res = asyncio.run(execute_trade(_ectx, "tok", "BUY", 5.0, 0.5, _uid))
             _assert(_res is _ok and _ectx.pending_orders[_uid]["status"] == _status,
                     f"V2 FOK response {_response.get('status') or 'rejected'} -> ok={_ok} status={_status}")
+        _assert(len(_ectx.order_latency_ms) == 1, "order latency recorded")
         _market_args = _ectx.clob_client.calls[0][1]
         _assert(not hasattr(_market_args, "fee_rate_bps") and _market_args.amount == 5.0,
                 "V2 market order has no fee_rate_bps, amount = notional")
@@ -4671,6 +4752,31 @@ def _run_tests() -> None:
             sys.modules.pop("py_clob_client_v2", None)
         else:
             sys.modules["py_clob_client_v2"] = _saved_module
+
+    # Latency: post_order hash polling disabled, event backlog coalesced
+    class _PollingClient:
+        def _resolve_transactions_hashes(self, response: Any) -> Any:
+            time.sleep(30.0)
+            return response
+    _pc = _PollingClient()
+    _assert(disable_trade_hash_polling(_pc) and _pc._resolve_transactions_hashes({"a": 1}) == {"a": 1},
+            "post_order trade-hash polling disabled")
+    _assert(not disable_trade_hash_polling(object()), "unknown SDK shape -> no patch")
+
+    async def _drain_check() -> Tuple[int, int, int]:
+        bus = EventBus()
+        for _ in range(5):
+            await bus.publish(MarketEvent(type=EventType.PRICE_UPDATE))
+        first = await bus.consume(timeout=0.1)
+        drained = bus.drain()
+        return int(first is not None), len(drained), bus.qsize()
+    _assert(asyncio.run(_drain_check()) == (1, 4, 0), "EventBus.drain coalesces backlog")
+    try:
+        BotConfig(live_trading=True, polymarket_private_key="k",
+                  partial_tp_active=True).validate()
+        _assert(False, "live + partial TP rejected (no live SELL path)")
+    except ValueError:
+        _assert(True, "live + partial TP rejected (no live SELL path)")
 
     # Dynamic TP covers the real sell fee
     _tp_trade = Trade(side="UP", ask=0.50, bid_at_buy=0.49, eff_c=51.75,
@@ -4760,6 +4866,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     try:
-        asyncio.run(main())
+        import uvloop  # Linux/macOS: faster event loop and socket I/O
+        _run_loop = uvloop.run
+    except ImportError:
+        _run_loop = asyncio.run
+    try:
+        _run_loop(main())
     except KeyboardInterrupt:
         pass
