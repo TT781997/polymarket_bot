@@ -30,6 +30,7 @@ fee = shares × 0.07 × price × (1 - price)
 ```
 - p=0,50 → 1,75c/share (3,5% do notional); p=0,90 → 0,63c; p=0,97 → 0,20c. Maker paga 0.
 - A fórmula antiga (`0.25 × p × (p(1−p))²`) subestimava a taxa 2x–10x.
+- Em cada ciclo o bot lê o fee schedule do mercado (`/clob-markets`, `fd.r`/`fd.e`). Se não for `r=0.07, e=1`, as entradas ficam bloqueadas nesse ciclo; em live, um fee schedule indisponível também bloqueia.
 - `fee_buffer = 0.006` é margem de slippage **por cima** da taxa real em todos os filtros de edge e no Kelly.
 
 **Maker Rebate (v5.3.1)**
@@ -161,6 +162,7 @@ Mercado com **forte viés para DOWN** (P(DN)=80.3%). O bot provavelmente vai ent
 ## 5. Configuração e Parametrização (detalhada)
 
 **Credenciais: variáveis de ambiente** (`PRIVATE_KEY`, `API_KEY`, `API_SECRET`, `API_PASSPHRASE`).
+CLOB V2: `POLYMARKET_FUNDER` (ou `WALLET_ADDRESS`, carteira proxy/safe com pUSD) e `SIGNATURE_TYPE` (0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE, 3=POLY_1271). Sem API keys, o bot deriva-as da chave privada.
 `secrets.txt` é só fallback legado, está no `.gitignore` e gera aviso `[SECURITY]` ao ser lido.  
 **control.json** (kill switch, relido quando muda): `{"kill_switch": true}` ou `{"paused": true}` bloqueia novas entradas; JSON inválido bloqueia (fail closed).  
 **config.json** (v5.3.1 – hot-reload a cada 15s)  
@@ -185,7 +187,7 @@ Mercado com **forte viés para DOWN** (P(DN)=80.3%). O bot provavelmente vai ent
 ## 7. Instalação e Execução
 
 ```bash
-pip install websockets py-clob-client web3 requests orjson numpy
+pip install websockets py-clob-client-v2 web3 requests orjson numpy
 python xrp_true_market_maker_v5_3_1.py
 python xrp_bot_v9_4_1.py
 ```

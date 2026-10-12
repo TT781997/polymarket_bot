@@ -36,7 +36,6 @@ import queue
 import random
 import signal
 import stat
-import subprocess
 import sys
 import time
 import traceback
@@ -124,6 +123,10 @@ class BotConfig:
     polymarket_api_key: str = ""
     polymarket_secret: str = ""
     polymarket_passphrase: str = ""
+    # v9.5.0 CLOB V2: funder = proxy/safe wallet holding pUSD; signature type
+    # 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE, 3=POLY_1271
+    polymarket_funder: str = ""
+    polymarket_signature_type: int = 0
     state_file: str = "trade_state.json"
     audit_file: str = "trade_audit.jsonl"
     secrets_path: str = "secrets.txt"
@@ -259,6 +262,11 @@ class BotConfig:
     def validate(self) -> None:
         if self.live_trading and not self.polymarket_private_key:
             raise ValueError("polymarket_private_key required for LIVE_TRADING")
+        if self.polymarket_signature_type not in (0, 1, 2, 3):
+            raise ValueError("polymarket_signature_type must be 0, 1, 2 or 3")
+        if self.live_trading and self.polymarket_signature_type != 0 \
+                and not self.polymarket_funder:
+            raise ValueError("polymarket_funder required for signature_type != 0")
         if self.mart_max_mult != 1:
             raise ValueError("mart_max_mult must be 1 (martingale removed)")
         if self.kelly_max_risk_pct > 0.02:
@@ -294,6 +302,9 @@ class BotConfig:
         cfg.polymarket_api_key = _get("API_KEY", "", "POLYMARKET_API_KEY")
         cfg.polymarket_secret = _get("API_SECRET", "", "POLYMARKET_SECRET")
         cfg.polymarket_passphrase = _get("API_PASSPHRASE", "", "POLYMARKET_PASSPHRASE")
+        cfg.polymarket_funder = _get("POLYMARKET_FUNDER", "", "WALLET_ADDRESS")
+        cfg.polymarket_signature_type = int(_get("SIGNATURE_TYPE", "0",
+                                                 "POLYMARKET_SIGNATURE_TYPE"))
         if _get("DRY_RUN", "1").lower() in ("0", "false", "no"):
             cfg.dry_run = False
         if _get("LIVE_TRADING", "0").lower() in ("1", "true", "yes"):
@@ -981,6 +992,8 @@ class BotContext:
     has_sdk: bool = False
     bot_start_time: float = field(default_factory=time.time)
     trading_disabled: bool = False
+    # v9.5.0: set per cycle when the market fee schedule differs from the EV model
+    fee_model_mismatch: bool = False
     session_stop_reason: str = ""
     pending_orders: Dict[str, Dict] = field(default_factory=dict)
     last_reconciled_bankroll: Decimal = field(default_factory=lambda: _ZERO)
@@ -1283,6 +1296,8 @@ class CapitalSafetyMonitor:
         if ctx.trading_disabled:
             return True
         if self._control_blocks():
+            return True
+        if ctx.fee_model_mismatch:
             return True
         now = time.time()
         state = self._tsm.state
@@ -2156,6 +2171,16 @@ class HFTWindow:
 # Crypto taker fee rate (docs.polymarket.com/trading/fees, CLOB V2).
 # Makers pay 0. Override per market once feeSchedule is read from the API.
 CRYPTO_TAKER_FEE_RATE = 0.07
+CRYPTO_TAKER_FEE_EXPONENT = 1.0
+
+
+def market_fee_matches_model(rate: float, exponent: float) -> bool:
+    """True if the market fee (CLOB V2 fd: fee = C x r x (p(1-p))^e) is at most
+    what polymarket_fee() assumes. r == 0 means fees disabled: model is conservative."""
+    if rate <= 0.0:
+        return True
+    return (abs(rate - CRYPTO_TAKER_FEE_RATE) < 1e-9
+            and abs(exponent - CRYPTO_TAKER_FEE_EXPONENT) < 1e-9)
 
 
 def polymarket_fee(
@@ -2471,27 +2496,40 @@ async def execute_trade(
         ctx.pending_orders[order_uuid]["status"] = "aborted_no_client"
         return False
     try:
-        from py_clob_client.clob_types import OrderType
-        fee_bps = ctx.fee_cache.get(token_id, ctx.cfg.default_taker_fee_bps)
-        if use_limit:
-            order = ctx.clob_client.create_limit_order(
-                token_id=token_id, side=side, price=price,
-                size=shares, fee_rate_bps=fee_bps,
-                options={"tick_size": "0.01", "neg_risk": False},
-            )
-            ctx.clob_client.post_order(order, OrderType.GTC)
-        else:
-            order = ctx.clob_client.create_market_order(
-                token_id=token_id, side=side, amount=amount, price=price,
-                fee_rate_bps=fee_bps,
-                options={"tick_size": "0.01", "neg_risk": False},
-            )
-            ctx.clob_client.post_order(order, OrderType.FOK)
+        # v9.5.0 CLOB V2: no feeRateBps (fee charged at match, on top of a BUY
+        # amount); tick size and neg_risk resolved and cached by the SDK.
+        from py_clob_client_v2 import (
+            MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions,
+        )
+        client = ctx.clob_client
+        options = PartialCreateOrderOptions()
+
+        def _send() -> Any:
+            if use_limit:
+                order = client.create_order(
+                    OrderArgs(token_id=token_id, price=price, size=shares,
+                              side=side), options)
+                return client.post_order(order, OrderType.GTC, post_only=True)
+            order = client.create_market_order(
+                MarketOrderArgs(token_id=token_id, amount=amount, side=side,
+                                price=price), options)
+            return client.post_order(order, OrderType.FOK)
+
+        response = await asyncio.get_running_loop().run_in_executor(None, _send)
+        if not isinstance(response, dict) or not response.get("success") \
+                or response.get("errorMsg"):
+            error = response.get("errorMsg") if isinstance(response, dict) \
+                else response
+            raise RuntimeError(f"order rejected: {error}")
+        order_status = str(response.get("status", ""))
         log_info(
-            f"[EXEC] {_ot_label} SENT | fee_bps={fee_bps} | "
+            f"[EXEC] {_ot_label} SENT | status={order_status} | "
             f"shares={shares:.4f} | uuid={order_uuid[:12]}..."
         )
-        ctx.pending_orders[order_uuid]["status"] = "filled"
+        ctx.pending_orders[order_uuid]["status"] = \
+            "filled" if order_status == "matched" else "sent"
+        ctx.pending_orders[order_uuid]["order_status"] = order_status
+        ctx.pending_orders[order_uuid]["order_id"] = response.get("orderID")
         ctx.pending_orders[order_uuid]["ok"] = True
         return True
     except Exception as exc:
@@ -2578,99 +2616,42 @@ async def fetch_live_bankroll(ctx: BotContext) -> Optional[Decimal]:
     if not ctx.cfg.live_trading or ctx.clob_client is None:
         return None
     try:
+        # v9.5.0 CLOB V2: pUSD collateral balance, 6 decimals (base units)
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
         loop = asyncio.get_running_loop()
         balance = await loop.run_in_executor(
-            None, lambda: ctx.clob_client.get_balance()
+            None, lambda: ctx.clob_client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
         )
         if isinstance(balance, dict) and "balance" in balance:
-            return _d(balance["balance"])
-        if isinstance(balance, (int, float, str)):
-            return _d(balance)
+            return _dq(_d(balance["balance"]) / _d("1000000"))
         return None
     except Exception as exc:
         log_warn(f"[BANKROLL] fetch_live_bankroll failed: "
                  f"{type(exc).__name__}: {exc}")
         return None
 
-def _fetch_fee_via_sdk(clob_client: Any, token_id: str) -> Optional[int]:
-    try:
-        fn = getattr(clob_client, "get_fee_rate_bps", None)
-        if fn is not None:
-            result = fn(token_id)
-            if isinstance(result, (int, float)) and result > 0:
-                return int(result)
-            if isinstance(result, dict):
-                bps = int(result.get("base_fee", 0) or
-                          result.get("fee_rate_bps", 0))
-                if bps > 0:
-                    return bps
-    except Exception as exc:
-        log_warn(f"[FEE] SDK get_fee_rate_bps failed: {type(exc).__name__}: "
-                 f"{exc}")
-    return None
+async def fetch_market_fee_info(
+    condition_id: str, ctx: BotContext
+) -> Optional[Tuple[float, float]]:
+    """CLOB V2 market fee schedule (rate r, exponent e) from /clob-markets.
 
-def _fetch_fee_via_curl(clob_url: str, token_id: str) -> Optional[int]:
-    url = f"{clob_url}/fee-rate?token_id={token_id}"
-    cmd = [
-        "curl", "-s", "-S",
-        "--max-time", "10",
-        "-H", ("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 "
-               "Safari/537.36"),
-        "-H", "Accept: application/json, text/plain, */*",
-        "-H", "Origin: https://polymarket.com",
-        "-H", "Referer: https://polymarket.com/",
-        url,
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=15)
-        raw_out = proc.stdout.decode("utf-8", errors="replace").strip()
-        if proc.returncode != 0:
-            return None
-        if raw_out.startswith("<") or "<!DOCTYPE" in raw_out[:50]:
-            return None
-        data = json.loads(raw_out)
-        bps = int(data.get("fee_rate_bps", 0))
-        if bps > 0:
-            return bps
-        return None
-    except Exception:
-        return None
-
-async def fetch_fee_for_token(token_id: str, ctx: BotContext) -> int:
-    """Fetch Polymarket fee for a token from SDK or REST.
-
-    Note: the bps value here is only used for legacy flat-rate arb edge
-    calculations (fee_rate_lut). Actual order fees use polymarket_fee().
+    Returns None when unavailable. Missing fd means fees disabled -> (0, 0).
     """
-    loop = asyncio.get_running_loop()
-    if ctx.clob_client is not None:
-        bps = await loop.run_in_executor(
-            None, _fetch_fee_via_sdk, ctx.clob_client, token_id
+    client = ctx.clob_ro_client or ctx.clob_client
+    if client is None:
+        return None
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, client.get_clob_market_info, condition_id
         )
-        if bps is not None:
-            ctx.fee_cache[token_id] = bps
-            log_info(f"[FEE] token={token_id[:16]}... -> {bps} bps (SDK auth)")
-            return bps
-    if ctx.clob_ro_client is not None and ctx.clob_ro_client != ctx.clob_client:
-        bps = await loop.run_in_executor(
-            None, _fetch_fee_via_sdk, ctx.clob_ro_client, token_id
-        )
-        if bps is not None:
-            ctx.fee_cache[token_id] = bps
-            log_info(f"[FEE] token={token_id[:16]}... -> {bps} bps (SDK ro)")
-            return bps
-    bps = await loop.run_in_executor(
-        None, _fetch_fee_via_curl, ctx.cfg.clob_rest_url, token_id
-    )
-    if bps is not None:
-        ctx.fee_cache[token_id] = bps
-        log_info(f"[FEE] token={token_id[:16]}... -> {bps} bps (curl)")
-        return bps
-    fallback = ctx.fee_cache.get(token_id, ctx.cfg.default_taker_fee_bps)
-    log_warn(f"[FEE] ALL TIERS FAILED for {token_id[:16]}... | "
-             f"using cached/default={fallback} bps")
-    return fallback
+    except Exception as exc:
+        log_warn(f"[FEE] get_clob_market_info failed: {type(exc).__name__}: {exc}")
+        return None
+    fee_details = (result or {}).get("fd") or {}
+    return (float(fee_details.get("r", 0.0) or 0.0),
+            float(fee_details.get("e", 0.0) or 0.0))
+
 
 ###############################################################################
 # SECTION 23 -- BINANCE WS LOOP + FUNDING RATE
@@ -3033,7 +3014,7 @@ async def heartbeat_loop(ctx: BotContext) -> None:
             loop = asyncio.get_running_loop()
             snap = _id
             resp = await loop.run_in_executor(
-                None, lambda: ctx.clob_client.post_heartbeat(snap)
+                None, lambda: ctx.clob_client.post_heartbeat(snap or "")
             )
             if isinstance(resp, dict):
                 _new = resp.get("heartbeat_id") or resp.get("id") or \
@@ -3710,8 +3691,9 @@ async def logic_loop(
                 )
                 return None
             try:
+                # V2 charges the taker fee on top of the BUY amount at match
                 ok = await execute_trade(ctx, token_id, "BUY",
-                                         float(total_out), ask_f, order_uuid)
+                                         float(invested_pure), ask_f, order_uuid)
             except Exception as exc:
                 log_warn(f"[EXEC_FAILED] {type(exc).__name__}: {exc} | {side}")
                 raise
@@ -4211,7 +4193,7 @@ async def main() -> None:
                                 label="API_CB")
     ctx.meta_cb = CircuitBreaker(ft=10, rs=20.0, label="META_CB")
     try:
-        from py_clob_client.client import ClobClient
+        from py_clob_client_v2 import ApiCreds, ClobClient
         ctx.has_sdk = True
         ctx.clob_ro_client = ClobClient(host=cfg.clob_rest_url, chain_id=137)
         if cfg.live_trading:
@@ -4220,18 +4202,28 @@ async def main() -> None:
                     "polymarket_private_key required for LIVE_TRADING"
                 )
             ctx.clob_client = ClobClient(
-                host=cfg.clob_rest_url, key=cfg.polymarket_private_key,
-                chain_id=137
+                host=cfg.clob_rest_url, chain_id=137,
+                key=cfg.polymarket_private_key,
+                signature_type=cfg.polymarket_signature_type,
+                funder=cfg.polymarket_funder or None,
             )
-            log_info("[BOOT] SDK -- LIVE TRADING ACTIVE")
+            if cfg.polymarket_api_key and cfg.polymarket_secret and \
+                    cfg.polymarket_passphrase:
+                creds = ApiCreds(api_key=cfg.polymarket_api_key,
+                                 api_secret=cfg.polymarket_secret,
+                                 api_passphrase=cfg.polymarket_passphrase)
+            else:
+                creds = ctx.clob_client.create_or_derive_api_key()
+            ctx.clob_client.set_api_creds(creds)
+            log_info("[BOOT] SDK V2 -- LIVE TRADING ACTIVE")
         else:
-            log_info("[BOOT] SDK -- DEMO MODE")
+            log_info("[BOOT] SDK V2 -- DEMO MODE")
     except ImportError:
         if cfg.live_trading:
             raise SystemExit(
-                "py-clob-client not installed -- required for LIVE_TRADING=True"
+                "py-clob-client-v2 not installed -- required for LIVE_TRADING=True"
             )
-        log_warn("[BOOT] py-clob-client not installed -- DEMO ONLY")
+        log_warn("[BOOT] py-clob-client-v2 not installed -- DEMO ONLY")
     except SystemExit:
         raise
     except Exception as e:
@@ -4319,13 +4311,22 @@ async def main() -> None:
             )
             await asyncio.sleep(_wait)
             continue
-        fee_up = await fetch_fee_for_token(meta["up"], ctx)
-        fee_dn = await fetch_fee_for_token(meta["down"], ctx)
-        ctx.fee_cache[meta["up"]] = fee_up
-        ctx.fee_cache[meta["down"]] = fee_dn
-        log_info(
-            f"[CYCLE START] fees UP={fee_up}bps DOWN={fee_dn}bps | slug={slug}"
-        )
+        fee_info = await fetch_market_fee_info(meta["id"], ctx)
+        if fee_info is None:
+            # Fail closed live; dry_run keeps the model assumption
+            ctx.fee_model_mismatch = cfg.live_trading
+            log_warn(f"[FEE] fee schedule unavailable | slug={slug} | "
+                     f"{'entries BLOCKED' if cfg.live_trading else 'assuming model'}")
+        else:
+            fee_rate, fee_exponent = fee_info
+            ctx.fee_model_mismatch = not market_fee_matches_model(
+                fee_rate, fee_exponent)
+            (log_warn if ctx.fee_model_mismatch else log_info)(
+                f"[CYCLE START] fee r={fee_rate} e={fee_exponent} | model "
+                f"r={CRYPTO_TAKER_FEE_RATE} e={CRYPTO_TAKER_FEE_EXPONENT} | "
+                f"{'MISMATCH -- entries BLOCKED' if ctx.fee_model_mismatch else 'ok'}"
+                f" | slug={slug}"
+            )
         ctx.resolved_event.clear()
         ctx.resolved_winner_asset = None
         ctx.current_condition_id = meta["id"]
@@ -4606,6 +4607,71 @@ def _run_tests() -> None:
     _assert(calc_kelly_bayesian(0.99, 0.50, cfg) == cfg.kelly_max_risk_pct,
             "kelly capped at kelly_max_risk_pct")
 
+    # CLOB V2 market fee guard
+    _assert(market_fee_matches_model(0.07, 1.0), "fee schedule r=0.07 e=1 matches model")
+    _assert(market_fee_matches_model(0.0, 0.0), "fees disabled -> model conservative")
+    _assert(not market_fee_matches_model(0.072, 1.0), "r=0.072 -> mismatch (blocks)")
+    _assert(not market_fee_matches_model(0.25, 2.0), "legacy r=0.25 e=2 -> mismatch")
+    _v2_ctx = BotContext(cfg=cfg, audit=None)
+
+    class _FakeV2Client:
+        def __init__(self, response: Any) -> None:
+            self.response = response
+            self.calls: List[Tuple[str, Any]] = []
+        def get_clob_market_info(self, condition_id: str) -> dict:
+            return {"t": [{"t": "tok"}], "fd": {"r": 0.07, "e": 1}}
+        def create_market_order(self, args: Any, options: Any) -> Any:
+            self.calls.append(("market", args))
+            return args
+        def create_order(self, args: Any, options: Any) -> Any:
+            self.calls.append(("limit", args))
+            return args
+        def post_order(self, order: Any, order_type: str, post_only: bool = False) -> Any:
+            self.calls.append(("post", (order_type, post_only)))
+            return self.response
+
+    _v2_ctx.clob_ro_client = _FakeV2Client(None)
+    _assert(asyncio.run(fetch_market_fee_info("cid", _v2_ctx)) == (0.07, 1.0),
+            "fetch_market_fee_info parses fd")
+
+    # execute_trade against a stub of the V2 SDK surface (no third-party code run)
+    import types as _types
+    _stub = _types.ModuleType("py_clob_client_v2")
+    _stub.OrderType = _types.SimpleNamespace(GTC="GTC", FOK="FOK")
+    _stub.PartialCreateOrderOptions = lambda: None
+    _stub.OrderArgs = lambda **kw: _types.SimpleNamespace(**kw)
+    _stub.MarketOrderArgs = lambda **kw: _types.SimpleNamespace(**kw)
+    _saved_module = sys.modules.get("py_clob_client_v2")
+    sys.modules["py_clob_client_v2"] = _stub
+    try:
+        _live_cfg = BotConfig(dry_run=False)
+        for _response, _ok, _status in (
+            ({"success": True, "status": "matched", "orderID": "o1"}, True, "filled"),
+            ({"success": True, "status": "delayed", "orderID": "o2"}, True, "sent"),
+            ({"success": False, "errorMsg": "not enough balance"}, False, "failed"),
+        ):
+            _ectx = BotContext(cfg=_live_cfg, audit=None)
+            _ectx.l2_up.ts = _ectx.l2_down.ts = time.time()
+            _ectx.clob_client = _FakeV2Client(_response)
+            _uid = str(uuid.uuid4())
+            _res = asyncio.run(execute_trade(_ectx, "tok", "BUY", 5.0, 0.5, _uid))
+            _assert(_res is _ok and _ectx.pending_orders[_uid]["status"] == _status,
+                    f"V2 FOK response {_response.get('status') or 'rejected'} -> ok={_ok} status={_status}")
+        _market_args = _ectx.clob_client.calls[0][1]
+        _assert(not hasattr(_market_args, "fee_rate_bps") and _market_args.amount == 5.0,
+                "V2 market order has no fee_rate_bps, amount = notional")
+        _lctx = BotContext(cfg=_live_cfg, audit=None)
+        _lctx.l2_up.ts = _lctx.l2_down.ts = time.time()
+        _lctx.clob_client = _FakeV2Client({"success": True, "status": "live"})
+        asyncio.run(execute_trade(_lctx, "tok", "BUY", 5.0, 0.5, "l1", use_limit=True))
+        _assert(_lctx.clob_client.calls[-1] == ("post", ("GTC", True)),
+                "V2 limit order is GTC post-only")
+    finally:
+        if _saved_module is None:
+            sys.modules.pop("py_clob_client_v2", None)
+        else:
+            sys.modules["py_clob_client_v2"] = _saved_module
+
     # Dynamic TP covers the real sell fee
     _tp_trade = Trade(side="UP", ask=0.50, bid_at_buy=0.49, eff_c=51.75,
                       shares=_d("10"), target=None, type="GAMBLING",
@@ -4646,6 +4712,9 @@ def _run_tests() -> None:
     _assert(_mon._control_blocks(), "invalid control.json fails closed")
     _ctl.unlink()
     _assert(not _mon._control_blocks(), "missing control.json does not block")
+    _fee_ctx = BotContext(cfg=cfg, audit=None)
+    _fee_ctx.fee_model_mismatch = True
+    _assert(_mon.check(_fee_ctx), "fee schedule mismatch blocks entries")
 
     # VolatilityEdgeTracker
     vet = VolatilityEdgeTracker(cfg)
